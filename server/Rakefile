@@ -1,0 +1,14 @@
+# server/Rakefile
+
+require 'rspec/core/rake_task'
+
+# Auto-load every .rake file under lib/tasks/.
+Dir[File.expand_path('lib/tasks/*.rake', __dir__)].sort.each { |t| load t }
+
+# Default task: run the RSpec suite.
+RSpec::Core::RakeTask.new(:spec) do |t|
+  t.pattern = 'spec/**/*_spec.rb'
+  t.rspec_opts = '--format progress'
+end
+
+task default: :spec

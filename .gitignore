@@ -1,0 +1,5 @@
+/.claude/scheduled_tasks.lock
+.env
+/AGENTS.md
+/_data/*
+/_log/*

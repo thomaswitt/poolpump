@@ -1,0 +1,607 @@
+/**
+ * Pool Heater controller. Single source of truth for pool-heating behaviour.
+ *
+ * Intent model:
+ *   The virtual device's Power switch (boolean1) is a SOFT INTENT - "heat
+ *   when economical, off otherwise". Not a direct on/off to the pump.
+ *   The pump's actual on/off is decided here based on outside-air temp,
+ *   time of day, pool-vs-target gap, and an optional Boost override.
+ *
+ * Cadence:
+ *   Triggered by an Advanced Flow on a 5-minute cron (no script timer -
+ *   keeps the flow visible to the operator). Also re-runnable on demand
+ *   from device-toggle triggers.
+ *
+ * Strategy:
+ *   - Heat only when ambient >= 22C AND time in 10:00..17:00 local.
+ *   - Mode: silent by default (highest COP, lowest draw). Smart-upgrade
+ *     on a wide gap is gated by SMART_GAP_C — set to 0 to disable
+ *     entirely (the energy-saving default). Boost is the user override
+ *     for faster, more-expensive heating.
+ *   - Stop when pool >= target + hysteresis (avoids on/off thrash).
+ *   - Hard floor: ambient < 18C never heats, even if intent ON.
+ */
+"use strict";
+
+// --- configuration --------------------------------------------------------
+
+const POOLPUMP_HOST = "http://192.168.3.2:8090";
+const PUMP_HTTP_TIMEOUT_MS = 4000;
+
+// Devices (looked up by name to survive ID changes; trim-aware to match
+// the leading-space quirk on `' Netatmo Terrasse'`).
+const VDEVICE_NAME = "Pool Heater";
+const NETATMO_OUTDOOR_NAME = " Netatmo Terrasse";
+
+// Local timezone for time-of-day decisions and the `Last Updated` text.
+// HomeyScript runs on Athom Cloud where Date defaults to UTC; without an
+// explicit zone, our heating window (11-17 local) would be evaluated in
+// UTC = 14-20, which is wrong.
+const TIMEZONE = "Europe/Nicosia";
+
+// Strategy thresholds (see project_pool_heat_strategy.md).
+const AMBIENT_HARD_FLOOR_C = 18; // below this: never heat
+const AMBIENT_SOFT_FLOOR_C = 22; // below this in window: only with explicit boost
+const HEATING_WINDOW_START_H = 10; // local time
+const HEATING_WINDOW_END_H = 17;
+const TARGET_HYSTERESIS_C = 0.5; // stop heating when pool >= target + this; resume when <= target - this
+// Smart-mode upgrade threshold: if (target - pool) > SMART_GAP_C, upgrade
+// silent → smart for faster heat at higher consumption.
+//   0  = DISABLED — always run silent (energy-saving default).
+//   2  = old behavior — upgrade when pool is >2°C below target.
+// Boost is independent of this knob.
+const SMART_GAP_C = 0;
+
+// Capability field IDs on the existing DeviceCapabilities-app virtual device.
+// Discovered by inspecting `Homey.devices.getDevices()` state:
+//   number3 Ambient, number4 Compressor, number5 Outlet, number6 Target Set
+//   text1 Last Updated, text2 OperatingStatus, boolean1/2 Power/Boost intents.
+//
+// Pool temperature is NOT a DeviceCapabilities custom field on this device
+// (despite what the old flow assumed) - it's the standard Homey
+// `measure_temperature` capability that renders on the tile. Written via
+// direct `setCapabilityValue` below, not through `runFlowCardAction`.
+const VFIELD = {
+  power_intent: { id: "boolean1", name: "Power" },
+  boost_intent: { id: "boolean2", name: "Boost Mode" },
+  pool_temp: { id: "number1", name: "Temperature (Measured)" }, // mirrors to standard measure_temperature → gauge "Current temperature"
+  ambient: { id: "number3", name: "Ambient Temperature" },
+  compressor: { id: "number4", name: "Compressor Rate" },
+  outlet: { id: "number5", name: "Outlet Temperature" },
+  target_set: { id: "number6", name: "Target Temperature Set" },
+  last_updated: { id: "text1", name: "Last Updated" },
+  operating_status: { id: "text2", name: "OperatingStatus" },
+  // mode list (list1) removed from device — pool only ever heats,
+  // so cool/auto/heat selector was noise. Pump-side STATUS_MODE should stay
+  // pinned to 'heat'; we don't set it from this script (no `model heat`
+  // command verb in poolpump server yet — TODO if it ever drifts).
+};
+
+// --- helpers --------------------------------------------------------------
+
+const round1 = (n) => Math.round(n * 10) / 10;
+
+const findDevice = (devices, name) => {
+  const wanted = name.trim().toLowerCase();
+  const matches = Object.values(devices).filter(
+    (d) => d.name && d.name.trim().toLowerCase() === wanted,
+  );
+  if (matches.length === 0) throw new Error(`Device not found: "${name}"`);
+  if (matches.length > 1)
+    throw new Error(`Multiple devices named "${name}" - need disambiguation`);
+  return matches[0];
+};
+
+const readNumber = (device, capabilityId) => {
+  const v = device.capabilitiesObj?.[capabilityId]?.value;
+  if (typeof v !== "number")
+    throw new Error(`"${device.name}" missing capability "${capabilityId}"`);
+  return v;
+};
+
+// HomeyScript ships node-fetch v2.6.7 (per athombv.github.io/com.athom.homeyscript/).
+// node-fetch v2 supports a built-in `timeout` option that throws FetchError
+// after N ms - simpler and more portable than the AbortController dance.
+// We don't rely on global AbortController/setTimeout being polyfilled.
+//
+// Pump HTTP API:
+//   GET  /        -> 14-field JSON snapshot, or 500 if no telemetry yet.
+//   POST /        -> body 'on'|'off'|'mode-silent'|'mode-auto'|'mode-boost'|'settemp NN'
+const pumpStatus = async () => {
+  const res = await fetch(POOLPUMP_HOST + "/", {
+    timeout: PUMP_HTTP_TIMEOUT_MS,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`pump GET / -> HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
+};
+
+const pumpCommand = async (verb) => {
+  const res = await fetch(POOLPUMP_HOST + "/", {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: verb,
+    timeout: PUMP_HTTP_TIMEOUT_MS,
+  });
+  const body = await res.text().catch(() => "");
+  if (!res.ok)
+    throw new Error(
+      `pump POST '${verb}' -> HTTP ${res.status}: ${body.slice(0, 200)}`,
+    );
+  return body;
+};
+
+// Wrapper around the DeviceCapabilities app's flow cards. Mirrors the
+// existing 'Pool Heater' flow's pattern so the runtime contract is
+// identical - we just call them from script instead of from drag-drop.
+const setVField = async (vDevice, fieldKey, value) => {
+  const field = VFIELD[fieldKey];
+  if (!field) throw new Error(`unknown vfield "${fieldKey}"`);
+
+  const isBool = typeof value === "boolean";
+  const isNum = typeof value === "number";
+  const isStr = typeof value === "string";
+  const isList = !isBool && !isNum && !isStr; // list values are { id, name } objects
+
+  const cardSuffix = isBool
+    ? "virtualdevice_set_boolean"
+    : isNum
+      ? "virtualdevice_set_number"
+      : isList
+        ? "virtualdevice_set_list"
+        : "virtualdevice_set_text";
+
+  const args = { field };
+  if (isBool) args.boolean = value;
+  if (isNum) {
+    args.number = value;
+    args.mode = "nothing";
+  }
+  if (isStr) args.text = value;
+  if (isList) {
+    args.value = value;
+    args.mode = "nothing";
+  }
+
+  return Homey.flow.runFlowCardAction({
+    uri: `homey:device:${vDevice.id}`,
+    id: `homey:device:${vDevice.id}:${cardSuffix}`,
+    args,
+  });
+};
+
+// Format the current time in the configured local TZ. Using formatToParts
+// because we want to assemble the string ourselves (date format differs
+// from any built-in locale exactly enough to be annoying).
+const stamp = () => {
+  const parts = new Intl.DateTimeFormat("de-DE", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const get = (t) => parts.find((p) => p.type === t).value;
+  return `${get("hour")}:${get("minute")} (${get("day")}-${get("month")}-${get("year")})`;
+};
+
+// Hour-of-day in the configured local TZ. Plain `date.getHours()` returns
+// UTC on Athom Cloud, which would shift our heating window by 2-3 hours.
+const localHour = (date) =>
+  Number(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: TIMEZONE,
+      hour: "2-digit",
+      hour12: false,
+    }).format(date),
+  );
+
+const inHeatingWindow = (date) => {
+  const h = localHour(date);
+  return h >= HEATING_WINDOW_START_H && h < HEATING_WINDOW_END_H;
+};
+
+// --- decision -------------------------------------------------------------
+
+/**
+ * Returns {action, mode, reason}.
+ *   action: 'heat' | 'idle' | 'noop'
+ *   mode:   'silent' | 'smart' | 'boost' | null
+ *   reason: human-readable why-string (also written to virtual device)
+ *
+ * Precedence (top wins):
+ *   1. Power OFF                → idle (kill switch)
+ *   2. Pool already at target   → idle (even Boost respects this — once hot
+ *                                  enough, no point burning more energy;
+ *                                  hysteresis band prevents on/off thrash)
+ *   3. Boost ON                 → HEAT (boost mode), skips ALL weather/time
+ *                                  gates. "Heat now, I want the pool warm
+ *                                  fast — I'll pay for it."
+ *   4. Hard floor (ambient<18)  → idle (compressor protection — Boost can't
+ *                                  override this; the pump itself refuses
+ *                                  to run at <-15 ambient and gets unhappy
+ *                                  in low single digits)
+ *   5. Outside heating window   → idle (only economic gate that's a hard
+ *                                  block when Boost OFF; Cyprus nights at
+ *                                  600m kill COP regardless of ambient)
+ *   6. Soft floor (ambient<22)  → idle (suggests Boost as the override path)
+ *   7. Otherwise                → HEAT, mode by gap-to-target
+ *
+ * Note: under Boost, the cron tick reaffirms heat each cycle, so the
+ * 5-min reconciler does NOT fight the user — it just keeps re-sending
+ * `on`/`mode-boost` (which the pump no-ops because already-set).
+ */
+const decide = ({
+  intentOn,
+  boostOverride,
+  ambient,
+  poolTemp,
+  targetTemp,
+  now,
+}) => {
+  // 1. Power OFF — kill switch, overrides everything.
+  if (!intentOn) return { action: "idle", mode: null, reason: "intent OFF" };
+
+  // 2. Pool already at target — even Boost stops here.
+  if (
+    typeof poolTemp === "number" &&
+    poolTemp >= targetTemp + TARGET_HYSTERESIS_C
+  ) {
+    return {
+      action: "idle",
+      mode: null,
+      reason: `pool ${poolTemp}°C ≥ target ${targetTemp}+${TARGET_HYSTERESIS_C}°C`,
+    };
+  }
+
+  // 3. Boost = "heat now, ignore weather/time". User opt-in to inefficient
+  // heating in exchange for speed. Skips both floors AND the heating window.
+  if (boostOverride) {
+    return {
+      action: "heat",
+      mode: "boost",
+      reason: `BOOST: heating to ${targetTemp}°C, ignoring weather/time`,
+    };
+  }
+
+  // 4. Hard floor — true compressor protection, even Boost shouldn't push
+  // the pump below this ambient (manual: pump operates -15..43°C; below
+  // ~18°C COP is awful AND defrost cycles start eating energy).
+  if (ambient < AMBIENT_HARD_FLOOR_C)
+    return {
+      action: "idle",
+      mode: null,
+      reason: `ambient ${ambient}°C < hard floor ${AMBIENT_HARD_FLOOR_C}°C`,
+    };
+
+  // 5. Outside heating window — Cyprus 600m nights / mornings kill COP.
+  if (!inHeatingWindow(now)) {
+    return {
+      action: "idle",
+      mode: null,
+      reason: `outside heating window (now ${localHour(now)}:xx, allow ${HEATING_WINDOW_START_H}-${HEATING_WINDOW_END_H})`,
+    };
+  }
+
+  // 6. Soft floor — surfaces Boost as the explicit override path.
+  if (ambient < AMBIENT_SOFT_FLOOR_C) {
+    return {
+      action: "idle",
+      mode: null,
+      reason: `ambient ${ambient}°C below soft floor ${AMBIENT_SOFT_FLOOR_C}°C (toggle Boost to override)`,
+    };
+  }
+
+  // 7. Heat. Default = silent (highest COP). Optionally upgrade to smart
+  // when the gap-to-target exceeds SMART_GAP_C — set SMART_GAP_C = 0 to
+  // disable the upgrade entirely (energy-saving default). If the upgrade
+  // is disabled and the pump is currently in smart, reconcile() snaps it
+  // back to silent via the wantSilent && !isSilent branch.
+  let mode = "silent";
+  if (
+    SMART_GAP_C > 0 &&
+    typeof poolTemp === "number" &&
+    targetTemp - poolTemp > SMART_GAP_C
+  ) {
+    mode = "smart";
+  }
+  const reasonGap =
+    typeof poolTemp === "number"
+      ? `gap ${round1(targetTemp - poolTemp)}°C`
+      : "pool temp unknown";
+  return {
+    action: "heat",
+    mode,
+    reason: `heating ${mode} (ambient ${ambient}°C, ${reasonGap})`,
+  };
+};
+
+// Reconcile: send commands only if the pump's current state differs from
+// what `decide` wants. Avoids hammering the wire with no-op writes.
+//
+// Reconciles four orthogonal aspects, in order:
+//   1. Setpoint - sync user's target_temperature into pump's stored
+//      setpoint via the pure `set-target` verb (no on/off side effects).
+//   2. Model - force STATUS_MODE = 2 (heat). Pool only ever heats; if the
+//      pump drifted to cool/auto somehow, snap it back. Idempotent.
+//   3. Switch - on/off based on decision.action.
+//   4. Function - silent/smart/boost based on decision.mode (only when on).
+const reconcile = async (decision, snap, targetTemp) => {
+  const pumpOn = snap?.SWITCHED_ON === 1 || snap?.SWITCHED_ON === true;
+  const pumpMode = snap?.STATUS_MODE; // 1=cool, 2=heat, 4=auto
+  const isBoost = snap?.BOOST === 1 || snap?.BOOST === true;
+  const isSilent = snap?.SILENCE === 1 || snap?.SILENCE === true;
+
+  const sentVerbs = [];
+
+  // 1. Setpoint sync - always, regardless of pump state. Pump stores it
+  // persistently and will use it on the next on-cycle. Uses the pure
+  // `set-target` verb (single FC=0x06 to the setpoint register, no other
+  // side effects — distinct from `settemp` which also turns the pump on).
+  if (
+    typeof snap?.TEMP_TARGET === "number" &&
+    typeof targetTemp === "number" &&
+    snap.TEMP_TARGET !== targetTemp
+  ) {
+    await pumpCommand(`set-target ${targetTemp}`);
+    sentVerbs.push(`set-target ${targetTemp}`);
+  }
+
+  // 2. Model = heat enforcement. Pool only ever heats - if the pump
+  // drifted to cool (STATUS_MODE=1) or auto (4), snap it back. Idempotent
+  // single-register write via the existing `setmode heat` verb.
+  if (pumpMode !== 2) {
+    await pumpCommand("setmode heat");
+    sentVerbs.push("setmode heat");
+  }
+
+  // 3. Switch on/off based on decision.
+  if (decision.action === "heat" && !pumpOn) {
+    await pumpCommand("on");
+    sentVerbs.push("on");
+  } else if (decision.action === "idle" && pumpOn) {
+    await pumpCommand("off");
+    sentVerbs.push("off");
+  }
+
+  // 4. Function (silent/smart/boost) - only meaningful when heating.
+  // decide() returns mode in {silent, smart, boost}. Snap pump-side to
+  // match. The mode-auto branch covers the smart case (raw 0x0000 =
+  // neither silent nor boost bit set); it also fires when SMART_GAP_C
+  // is enabled and the pump needs to leave silent/boost for smart.
+  if (decision.action === "heat") {
+    const wantSilent = decision.mode === "silent";
+    const wantBoost = decision.mode === "boost";
+    if (wantSilent && !isSilent) {
+      await pumpCommand("mode-silent");
+      sentVerbs.push("mode-silent");
+    }
+    if (wantBoost && !isBoost) {
+      await pumpCommand("mode-boost");
+      sentVerbs.push("mode-boost");
+    }
+    if (!wantSilent && !wantBoost && (isSilent || isBoost)) {
+      await pumpCommand("mode-auto");
+      sentVerbs.push("mode-auto"); // 'smart' = neither bit
+    }
+  }
+  return sentVerbs;
+};
+
+// --- main -----------------------------------------------------------------
+
+const now = new Date();
+const devices = await Homey.devices.getDevices();
+const vDevice = findDevice(devices, VDEVICE_NAME);
+const netatmo = findDevice(devices, NETATMO_OUTDOOR_NAME);
+
+// Read intent (from the virtual device the user toggles).
+// `target_temperature` is the Homey thermostat-style capability the user
+// edits via the device tile / the thermostat target_temperature_set trigger.
+// We deliberately do NOT read `number6` (Target Temperature Set) because
+// that field is OUTPUT - reflects the pump's current setpoint, not user intent.
+const intentOn = Boolean(
+  vDevice.capabilitiesObj?.[
+    `onoffbuttontab_devicecapabilities_button-custom_6.${VFIELD.power_intent.id}`
+  ]?.value,
+);
+const boostOverride = Boolean(
+  vDevice.capabilitiesObj?.[
+    `onoffbuttontab_devicecapabilities_button-custom_24.${VFIELD.boost_intent.id}`
+  ]?.value,
+);
+const targetTempRaw = vDevice.capabilitiesObj?.target_temperature?.value;
+if (typeof targetTempRaw !== "number") {
+  throw new Error(
+    `"${VDEVICE_NAME}" missing target_temperature - set it on the device tile first`,
+  );
+}
+const targetTemp = targetTempRaw;
+
+// Read ground-truth ambient (Netatmo agrees with PQ03 within 1C per project memory)
+const ambientNetatmo = readNumber(netatmo, "measure_temperature");
+
+// Read current pump state. If pump is unreachable, abort cleanly - don't
+// try to issue commands blind.
+let snap = null;
+let snapErr = null;
+try {
+  snap = await pumpStatus();
+} catch (e) {
+  snapErr = e.message;
+}
+
+// Pool temp source. Three-step preference:
+//   1. TEMP_INLET (CONFIRMED, from block 1000 / addr 1001 with 0.1°C
+//      precision) — water RETURNING from pool to pump = best single-sensor
+//      proxy for the pool body itself.
+//   2. TEMP_OUTLET — water LEAVING the pump. Biased 2-5°C high while
+//      heating; equals inlet when pump is off and pipes have equalized.
+//   3. Last value on virtual device's measure_temperature (stale fallback).
+// Once pa10 (inlet) is reading on the pump-server side, step 1 always wins
+// and the `pool≈` ≈-symbol can become an `=` because it's no longer a proxy.
+const inletFromPump =
+  snap && typeof snap.TEMP_INLET === "number" ? snap.TEMP_INLET : null;
+const outletFromPump =
+  snap && typeof snap.TEMP_OUTLET === "number" ? snap.TEMP_OUTLET : null;
+const poolTempFromVDev = vDevice.capabilitiesObj?.measure_temperature?.value;
+const poolTemp =
+  inletFromPump ??
+  outletFromPump ??
+  (typeof poolTempFromVDev === "number" ? poolTempFromVDev : null);
+const poolTempIsTrue = inletFromPump !== null; // true = real inlet sensor; false = outlet proxy
+
+const decision = decide({
+  intentOn,
+  boostOverride,
+  ambient: ambientNetatmo,
+  poolTemp,
+  targetTemp,
+  now,
+});
+
+console.log(
+  `[decision] action=${decision.action} mode=${decision.mode ?? "-"} reason="${decision.reason}"`,
+);
+console.log(
+  `[inputs]  intent=${intentOn} boost=${boostOverride} ambient=${ambientNetatmo}°C pool=${poolTemp ?? "?"}°C target=${targetTemp}°C`,
+);
+
+let sentVerbs = [];
+if (snap) {
+  try {
+    sentVerbs = await reconcile(decision, snap, targetTemp);
+    if (sentVerbs.length)
+      console.log(`[reconcile] sent: ${sentVerbs.join(", ")}`);
+    else console.log(`[reconcile] no-op (pump already in desired state)`);
+  } catch (e) {
+    console.log(`[reconcile] FAILED: ${e.message}`);
+  }
+} else {
+  console.log(`[reconcile] SKIPPED - pump unreachable: ${snapErr}`);
+}
+
+// Push telemetry into the virtual device for the dashboard view. We
+// always update so the operator sees a fresh "Last Updated" timestamp
+// even when nothing changed - that itself is proof the script ran.
+const updates = [];
+if (snap) {
+  // pool_temp → number1 (Temperature Measured) → mirrors to standard
+  // measure_temperature → updates the thermostat gauge's "Current
+  // temperature" small number. Same flow card pattern as ambient/outlet
+  // (`virtualdevice_set_number` with field id `number1`); the magic that
+  // makes this update measure_temperature is the DC field's internal
+  // mirror config — invisible from outside, but proven by the manual
+  // "Set Temperature (Measured) to N" test card the user added.
+  if (typeof poolTemp === "number")
+    updates.push(setVField(vDevice, "pool_temp", poolTemp));
+  if (typeof snap.TEMP_AMBIENT === "number")
+    updates.push(setVField(vDevice, "ambient", snap.TEMP_AMBIENT));
+  if (typeof snap.TEMP_OUTLET === "number")
+    updates.push(setVField(vDevice, "outlet", snap.TEMP_OUTLET));
+  if (typeof snap.COMPRESSOR_RATE === "number")
+    updates.push(setVField(vDevice, "compressor", snap.COMPRESSOR_RATE));
+  if (typeof snap.TEMP_TARGET === "number")
+    updates.push(setVField(vDevice, "target_set", snap.TEMP_TARGET));
+  // Pool-temp display: the device's `measure_temperature` is a read-only
+  // mirror of the DeviceCapabilities Status field
+  // (measure_devicecapabilities_number-custom_26.status1) - direct
+  // setCapabilityValue throws "Capability Not Setable". The cleanest path
+  // is the DeviceCapabilities `virtualdevice_set_status` flow card, but its
+  // exact arg shape isn't documented and the existing flow never used it.
+  // For now we rely on `number5` (Outlet) to surface the same value -
+  // the operator can read pool temp from that field. Re-enable a dedicated
+  // write here once we confirm the Status flow card's arg shape from the UI.
+  //
+  // Mode display: the list1 field was removed from the device since pool
+  // only heats - no need to show cool/auto. The pump's actual function
+  // (silent/smart/boost) and on/off state are visible via Compressor Rate
+  // (0 Hz = off) and the Last Updated reason text.
+}
+// Update the Status field (which feeds the big "Temperature" tile and
+// the thermostat's small "current" reading). The capability isn't directly
+// settable - "Missing Capability Listener" - so we go through the
+// DeviceCapabilities `virtualdevice_set_status` flow card. Args mirror
+// `virtualdevice_set_number` based on the existing flow's pattern.
+// Wrapped in try/catch so an unknown-arg-shape rejection here doesn't
+// kill the whole run.
+if (typeof poolTemp === "number") {
+  try {
+    await Homey.flow.runFlowCardAction({
+      uri: `homey:device:${vDevice.id}`,
+      id: `homey:device:${vDevice.id}:virtualdevice_set_status`,
+      args: {
+        field: { id: "status1", name: "Status" },
+        number: poolTemp,
+        mode: "nothing",
+      },
+    });
+  } catch (e) {
+    console.log(`[status-write] flow-card failed (proceeding): ${e.message}`);
+  }
+}
+
+// Last-updated text doubles as the decision-reason line AND surfaces the
+// most operationally important values inline. After the device tile got
+// hard to read at-a-glance (multiple "28"s with different meanings), the
+// inlined `pool=NN°C ambient=NN°C target=NN°C` makes the operator's primary
+// question - "what's the pool temperature right now" - answerable from this
+// one line, regardless of whether the Status field write above succeeded.
+// `text1` (Last Updated) holds only the timestamp - per-tile numbers
+// already show the values that matter, and a long status string wraps
+// unreadably under the cloud icon.
+updates.push(setVField(vDevice, "last_updated", stamp()));
+
+// `text2` (OperatingStatus) carries the decision/reason in a compact
+// human-readable form — gets its own dedicated tile on the device.
+//   "⚠ FAULT — check pump panel for code (manual §13)"  ← takes priority
+//   "IDLE: ambient 20.7°C below soft floor 22°C"
+//   "HEATING silent (gap 7.4°C, load 56%)"
+//   "PUMP UNREACHABLE — last known state shown"
+const operatingStatus = (() => {
+  if (!snap) return "PUMP UNREACHABLE — last known values shown";
+  // Fault overrides everything — operator needs to see this first.
+  // The server's fault_label now returns full text like
+  // "P01: Water flow protection — no flow / blocked filter ..."
+  // so we just prefix it with ⚠ and surface the whole thing.
+  if (snap.STATUS_MALFUNC && snap.STATUS_MALFUNC !== "none") {
+    return `⚠ ${snap.STATUS_MALFUNC}`;
+  }
+  const loadPct = snap.COMPRESSOR_LOAD_PCT;
+  const loadPart =
+    typeof loadPct === "number" && loadPct > 0 ? `, load ${loadPct}%` : "";
+  if (decision.action === "heat") {
+    const reasonGap = decision.reason.match(/gap [\d.]+°C/)?.[0] ?? "";
+    const inner = [reasonGap, loadPart.replace(/^,\s*/, "")]
+      .filter(Boolean)
+      .join(", ");
+    return `HEATING ${decision.mode}${inner ? ` (${inner})` : ""}`;
+  }
+  if (decision.action === "idle") {
+    return `IDLE: ${decision.reason
+      .replace(/^intent\s+/i, "")
+      .replace(/\s*\(boost off\)$/, "")}`;
+  }
+  return decision.reason;
+})();
+updates.push(setVField(vDevice, "operating_status", operatingStatus));
+await Promise.all(updates);
+
+return {
+  ok: true,
+  decision,
+  inputs: {
+    intentOn,
+    boostOverride,
+    ambient: ambientNetatmo,
+    poolTemp,
+    targetTemp,
+  },
+  pumpReachable: !!snap,
+  sent: sentVerbs,
+  reason: decision.reason,
+};

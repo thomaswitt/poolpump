@@ -1,0 +1,29 @@
+source 'https://rubygems.org'
+
+ruby '>= 3.2'
+
+gem 'async', '~> 2.39'
+gem 'falcon', '~> 0.47'
+gem 'rack', '~> 3.1'
+gem 'json', '~> 2.7'
+gem 'rake'
+
+group :development do
+  gem 'colorize_logs'
+  gem 'ruby-lsp'
+  gem 'ruby-lsp-rails'
+  gem 'ruby-lsp-rspec', require: false
+end
+
+group :development, :test do
+  gem 'awesome_print'
+  gem 'brakeman', require: false
+  gem 'bundle-audit'
+  gem 'debug', platforms: %i[ mri windows ], require: 'debug/prelude'
+  gem 'dotenv'
+  gem 'ostruct'
+  gem 'rubocop-rails-omakase', require: false
+  gem 'rubocop-rake', require: false
+  gem 'rspec'
+  gem 'rufo'
+end

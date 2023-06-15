@@ -1,0 +1,40 @@
+services:
+  poolpump-emulator:
+    container_name: poolpump-emulator
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # Two ports per service:
+      #   MODBUS_HOST_PORT — where the HF-LPB130 module dials in (Poolpump).
+      #   HTTP_HOST_PORT   — HTTP API for home automation (Homey Pro Flows).
+      #
+      # Defaults are 502 + 8090 (production on the Pi). Override via .env or
+      # shell when running on a dev host where 502 is privileged or another
+      # listener already owns it:
+      #   MODBUS_HOST_PORT=5020 docker compose up -d
+      #
+      # MODBUS_HOST_BIND lets you pin the listener to a specific host
+      # interface — useful on a multi-homed machine where you only want
+      # Poolpump to reach you over one NIC (e.g. ethernet, not WiFi). Default
+      # 0.0.0.0 binds all interfaces.
+      - "${MODBUS_HOST_BIND:-0.0.0.0}:${MODBUS_HOST_PORT:-502}:${MODBUS_PORT:-502}"
+      - "${MODBUS_HOST_BIND:-0.0.0.0}:${HTTP_HOST_PORT:-8090}:${HTTP_PORT:-8090}"
+    # No volume mounts. Logs go to stdout — capture with `docker compose logs`
+    # or `docker logs poolpump-emulator`. Snapshots from `tools/reprovision.rb`
+    # are written host-side under `_data/snapshots/` (gitignored), never by
+    # the running emulator.
+    environment:
+      MODBUS_PORT: ${MODBUS_PORT:-502}
+      HTTP_PORT: ${HTTP_PORT:-8090}
+      BIND_ADDR: ${BIND_ADDR:-0.0.0.0}
+      COMMAND_DEADLINE_SEC: ${COMMAND_DEADLINE_SEC:-3.0}
+      # Auto-reboot watchdog. POOLPUMP_DEVICE_IP must be set for either the
+      # watchdog OR the POST /reboot HTTP route to be enabled. The watchdog
+      # itself is opt-out — set POOLPUMP_AUTO_REBOOT_AFTER_SEC=0 to disable
+      # while keeping manual reboot available.
+      POOLPUMP_DEVICE_IP: ${POOLPUMP_DEVICE_IP:-}
+      POOLPUMP_AUTO_REBOOT_AFTER_SEC: ${POOLPUMP_AUTO_REBOOT_AFTER_SEC:-300}
+      POOLPUMP_AUTO_REBOOT_COOLDOWN_SEC: ${POOLPUMP_AUTO_REBOOT_COOLDOWN_SEC:-300}
+      POOLPUMP_AUTO_REBOOT_DAILY_LIMIT: ${POOLPUMP_AUTO_REBOOT_DAILY_LIMIT:-6}

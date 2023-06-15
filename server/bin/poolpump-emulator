@@ -1,0 +1,120 @@
+#!/usr/bin/env ruby
+# Entry point — single async reactor running both the Modbus listener (port
+# 502, where the WiFi module dials in) and the Rack HTTP API (port 8090,
+# where home automation talks to us). The two communicate via the in-memory
+# PumpSession actor.
+
+require 'bundler/setup' if File.exist?(File.expand_path('../Gemfile.lock', __dir__))
+
+$LOAD_PATH.unshift File.expand_path('../lib', __dir__)
+
+require 'async'
+require 'async/http/server'
+require 'async/http/endpoint'
+require 'protocol/rack/adapter'
+require 'poolpump/pump_session'
+require 'poolpump/http_api'
+require 'poolpump/reboot_controller'
+
+MODBUS_PORT = Integer(ENV.fetch('MODBUS_PORT', 502))
+HTTP_PORT   = Integer(ENV.fetch('HTTP_PORT', 8090))
+BIND_ADDR   = ENV.fetch('BIND_ADDR', '0.0.0.0')
+DEADLINE    = Float(ENV.fetch('COMMAND_DEADLINE_SEC', 3.0))
+
+# Auto-reboot watchdog — when telemetry goes stale for this long, send the
+# AT+Z double-send recipe over UDP/48899 to bounce the WiFi module's TCP
+# stack. Default 300s (5min) — well above any cycle gap we've observed,
+# below the threshold at which Homey would alert on stale data anyway.
+DEVICE_IP                = ENV.fetch('POOLPUMP_DEVICE_IP', nil)
+AUTO_REBOOT_AFTER_SEC    = Float(ENV.fetch('POOLPUMP_AUTO_REBOOT_AFTER_SEC', '300'))
+AUTO_REBOOT_COOLDOWN_SEC = Float(ENV.fetch('POOLPUMP_AUTO_REBOOT_COOLDOWN_SEC', '300'))
+AUTO_REBOOT_DAILY_LIMIT  = Integer(ENV.fetch('POOLPUMP_AUTO_REBOOT_DAILY_LIMIT', '6'))
+WATCHDOG_TICK_SEC        = 30
+
+LOGGER = ->(msg) { $stdout.puts "[#{Time.now.strftime('%H:%M:%S.%L')}] #{msg}"; $stdout.flush }
+
+session  = Poolpump::PumpSession.new(logger: LOGGER)
+listener = Poolpump::ModbusListener.new(host: BIND_ADDR, port: MODBUS_PORT, session: session, logger: LOGGER)
+
+# RebootController is only spawned when POOLPUMP_DEVICE_IP is set — without
+# it we don't know where to send AT+Z. The /reboot HTTP route returns 503
+# when the controller is absent.
+reboot_controller = if DEVICE_IP
+                      Poolpump::RebootController.new(
+                        device_ip:    DEVICE_IP,
+                        cooldown_sec: AUTO_REBOOT_COOLDOWN_SEC,
+                        daily_limit:  AUTO_REBOOT_DAILY_LIMIT,
+                        logger:       LOGGER,
+                      )
+                    end
+
+app = Poolpump::HttpApi.new(session: session, deadline: DEADLINE, reboot_controller: reboot_controller, logger: LOGGER)
+
+# L1 — signal handlers set a cooperative-stop flag instead of calling exit
+# from the signal context. The reactor unwinds on its next tick, sockets
+# close cleanly, in-flight commands resolve with `session-stale`.
+%i[INT TERM].each do |sig|
+  trap(sig) do
+    # Signal handlers must avoid most Ruby method calls; this is the minimal safe set.
+    session.request_stop!
+  end
+end
+
+Sync do |task|
+  task.async do
+    LOGGER.call("[modbus] starting on #{BIND_ADDR}:#{MODBUS_PORT}")
+    listener.run
+  rescue StandardError => e
+    LOGGER.call("[modbus] crashed: #{e.class}: #{e.message}")
+    raise
+  end
+
+  task.async do
+    LOGGER.call("[http]   starting on #{BIND_ADDR}:#{HTTP_PORT}")
+    endpoint = Async::HTTP::Endpoint.parse("http://#{BIND_ADDR}:#{HTTP_PORT}")
+    rack_app = Protocol::Rack::Adapter.new(app)
+    Async::HTTP::Server.new(rack_app, endpoint).run
+  rescue StandardError => e
+    LOGGER.call("[http]   crashed: #{e.class}: #{e.message}")
+    raise
+  end
+
+  # Auto-reboot watchdog. Ticks every WATCHDOG_TICK_SEC and triggers a
+  # remote reboot when the snapshot has been stale longer than the
+  # configured threshold. Cooldown + daily cap inside RebootController.
+  if reboot_controller && AUTO_REBOOT_AFTER_SEC > 0
+    # "armed" not "enabled" — past-tense "enabled" reads ambiguously, as if
+    # the watchdog just *fired*. "armed" makes the passive ready-state
+    # obvious to operators skimming the startup banner.
+    LOGGER.call("[watchdog] armed — will auto-reboot if telemetry goes stale for >#{AUTO_REBOOT_AFTER_SEC.to_i}s " \
+                "(cooldown #{AUTO_REBOOT_COOLDOWN_SEC.to_i}s, daily cap #{AUTO_REBOOT_DAILY_LIMIT})")
+    task.async do
+      loop do
+        sleep WATCHDOG_TICK_SEC
+        hz = session.healthz
+        age = hz[:snapshot_age_sec]
+        next unless age && age > AUTO_REBOOT_AFTER_SEC
+
+        reboot_controller.reboot!(reason: "watchdog: snapshot_age=#{age.to_i}s > #{AUTO_REBOOT_AFTER_SEC.to_i}s")
+      rescue StandardError => e
+        LOGGER.call("[watchdog] tick error #{e.class}: #{e.message}")
+      end
+    end
+  elsif !reboot_controller
+    LOGGER.call('[watchdog] disabled — POOLPUMP_DEVICE_IP not set; manual /reboot also unavailable')
+  end
+
+  # L1 — stop poller. The signal handler sets `session.stopping?`; we observe
+  # it here and stop the parent task, which unwinds both servers in turn.
+  # Without this the listener stays blocked in accept(2) until Docker SIGKILLs.
+  task.async do
+    loop do
+      sleep 0.5
+      if session.stopping?
+        LOGGER.call('shutdown signal received — stopping reactor')
+        task.stop
+        break
+      end
+    end
+  end
+end

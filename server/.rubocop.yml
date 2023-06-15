@@ -1,0 +1,40 @@
+# .rubocop.yml
+
+inherit_gem:
+  rubocop-rails-omakase: rubocop.yml
+
+plugins:
+  - rubocop-rake
+  # - rubocop-rspec
+
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.4.2
+  Exclude:
+    - "**/*.json"
+    - "public/assets/**/*"
+    - "public/assets_test/**/*"
+
+Style/StringLiterals:
+  Enabled: true
+  EnforcedStyle: single_quotes
+  Exclude:
+    - "**/*.erb"
+  Include:
+    - "Gemfile"
+    - "**/*.rb"
+    - "**/*.rake"
+
+Style/TrailingCommaInArrayLiteral:
+  Enabled: true
+  EnforcedStyleForMultiline: consistent_comma
+
+Style/TrailingCommaInHashLiteral:
+  Enabled: true
+  EnforcedStyleForMultiline: consistent_comma
+
+Layout/SpaceInsideArrayLiteralBrackets:
+  EnforcedStyle: no_space
+
+Layout/TrailingEmptyLines:
+  Enabled: false
