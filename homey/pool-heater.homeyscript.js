@@ -69,7 +69,10 @@ const EXTERNAL_POOL_TEMP_SENSOR = true;
 // Discovered by inspecting `Homey.devices.getDevices()` state:
 //   number3 Ambient, number4 Compressor, number5 Outlet,
 //   number6 Power Consumption (Show-As measure_power → Insights "Power Usage")
-//   text1 Last Updated, text2 OperatingStatus, boolean1/2 Power/Boost intents.
+//   text1 Last Updated, text2 OperatingStatus, text3 Current Errors,
+//   boolean1/2 Power/Boost intents,
+//   boolean3 Pump Running (plain boolean, Insights graphs on/off bands),
+//   boolean4 Pump Error (Show-As alarm_pump_device → standard pump-alarm UI).
 //
 // Pool temperature is NOT a DeviceCapabilities custom field on this device
 // (despite what the old flow assumed) - it's the standard Homey
@@ -85,12 +88,15 @@ const EXTERNAL_POOL_TEMP_SENSOR = true;
 const VFIELD = {
   power_intent: { id: "boolean1", name: "Power" },
   boost_intent: { id: "boolean2", name: "Boost Mode" },
+  pump_running: { id: "boolean3", name: "Pump Running" },
+  pump_error: { id: "boolean4", name: "Pump Error" },
   ambient: { id: "number3", name: "Ambient Temperature" },
   compressor: { id: "number4", name: "Compressor Rate" },
   outlet: { id: "number5", name: "Outlet Temperature" },
   power_w: { id: "number6", name: "Power Consumption" },
   last_updated: { id: "text1", name: "Last Updated" },
   operating_status: { id: "text2", name: "OperatingStatus" },
+  current_errors: { id: "text3", name: "Current Errors" },
   // mode list (list1) removed from device — pool only ever heats,
   // so cool/auto/heat selector was noise. Pump-side STATUS_MODE should stay
   // pinned to 'heat'; we don't set it from this script (no `model heat`
@@ -303,7 +309,7 @@ const decide = ({
     return {
       action: "idle",
       mode: null,
-      reason: `outside heating window (now ${localHour(now)}:xx, allow ${HEATING_WINDOW_START_H}-${HEATING_WINDOW_END_H})`,
+      reason: `outside heating window (allowed ${HEATING_WINDOW_START_H}-${HEATING_WINDOW_END_H})`,
     };
   }
 
@@ -596,20 +602,14 @@ if (typeof poolTemp === "number") {
 updates.push(setVField(vDevice, "last_updated", stamp()));
 
 // `text2` (OperatingStatus) carries the decision/reason in a compact
-// human-readable form — gets its own dedicated tile on the device.
-//   "⚠ FAULT — check pump panel for code (manual §13)"  ← takes priority
+// human-readable form. Faults are NO LONGER mixed in here — they live in
+// their own `text3` (current_errors) field so both views are visible
+// simultaneously on the tile. Examples:
 //   "IDLE: ambient 20.7°C below soft floor 22°C"
 //   "HEATING silent (gap 7.4°C, load 56%)"
 //   "PUMP UNREACHABLE — last known state shown"
 const operatingStatus = (() => {
   if (!snap) return "PUMP UNREACHABLE — last known values shown";
-  // Fault overrides everything — operator needs to see this first.
-  // The server's fault_label now returns full text like
-  // "P01: Water flow protection — no flow / blocked filter ..."
-  // so we just prefix it with ⚠ and surface the whole thing.
-  if (snap.STATUS_MALFUNC && snap.STATUS_MALFUNC !== "none") {
-    return `⚠ ${snap.STATUS_MALFUNC}`;
-  }
   const loadPct = snap.COMPRESSOR_LOAD_PCT;
   const loadPart =
     typeof loadPct === "number" && loadPct > 0 ? `, load ${loadPct}%` : "";
@@ -628,6 +628,41 @@ const operatingStatus = (() => {
   return decision.reason;
 })();
 updates.push(setVField(vDevice, "operating_status", operatingStatus));
+
+// `text3` (current_errors) — fault description ONLY, empty when healthy.
+// Lets the operator see the fault text without it eclipsing the heating
+// state in operating_status.
+const currentErrors =
+  snap && snap.STATUS_MALFUNC && snap.STATUS_MALFUNC !== "none"
+    ? `⚠ ${snap.STATUS_MALFUNC}`
+    : "";
+updates.push(setVField(vDevice, "current_errors", currentErrors));
+
+// `boolean3` (pump_running) — derived "is the compressor actually working
+// right now". True iff the user-intent switch is on AND the pump reports
+// non-zero compressor frequency. Insights graphs the on/off transitions —
+// useful for daily run-time totals and "did it heat overnight" timelines.
+//
+// `boolean4` (pump_error) — Show-As alarm_pump_device → standard pump-
+// alarm UI (red dot + alarm-system integration). GATED on pump_running:
+// many fault codes (notably P01 "no water flow") are physically
+// meaningless when the pump isn't moving water, so they'd scream red
+// every idle minute and train the operator to ignore the alarm. The
+// underlying fault text stays visible in current_errors regardless —
+// gating only suppresses the screaming alarm, not the diagnostic info.
+//
+// Both writes are skipped when snap is unavailable so a transient
+// comms outage doesn't flip the alarm or running indicator spuriously.
+if (snap) {
+  const pumpRunning =
+    snap.SWITCHED_ON === 1 &&
+    typeof snap.COMPRESSOR_RATE === "number" &&
+    snap.COMPRESSOR_RATE > 0;
+  const hasFault = !!(snap.STATUS_MALFUNC && snap.STATUS_MALFUNC !== "none");
+  updates.push(setVField(vDevice, "pump_running", pumpRunning));
+  updates.push(setVField(vDevice, "pump_error", pumpRunning && hasFault));
+}
+
 await Promise.all(updates);
 
 return {
