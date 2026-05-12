@@ -52,6 +52,19 @@ const TARGET_HYSTERESIS_C = 0.5; // stop heating when pool >= target + this; res
 // Boost is independent of this knob.
 const SMART_GAP_C = 0;
 
+// Pool-temperature source — set per-installation:
+//   true  — the virtual device's `measure_temperature` is bound (via Homey
+//           "Reflect") to a dedicated water sensor (e.g. a Zigbee pool
+//           thermometer). Use that value for heating decisions and DO NOT
+//           overwrite it; Reflect would either fight the write or revert
+//           it. Falls back to pump inlet/outlet only if the virtual
+//           device has no value at all.
+//   false — no dedicated sensor. Use the pump's TEMP_INLET (block 1000 /
+//           addr 1001, 0.1°C precision) as the pool-temperature input,
+//           and overwrite the virtual device's `measure_temperature` with
+//           it every tick.
+const EXTERNAL_POOL_TEMP_SENSOR = true;
+
 // Capability field IDs on the existing DeviceCapabilities-app virtual device.
 // Discovered by inspecting `Homey.devices.getDevices()` state:
 //   number3 Ambient, number4 Compressor, number5 Outlet, number6 Target Set
@@ -435,25 +448,30 @@ try {
   snapErr = e.message;
 }
 
-// Pool temp source. Three-step preference:
-//   1. TEMP_INLET (CONFIRMED, from block 1000 / addr 1001 with 0.1°C
-//      precision) — water RETURNING from pool to pump = best single-sensor
-//      proxy for the pool body itself.
-//   2. TEMP_OUTLET — water LEAVING the pump. Biased 2-5°C high while
-//      heating; equals inlet when pump is off and pipes have equalized.
-//   3. Last value on virtual device's measure_temperature (stale fallback).
-// Once pa10 (inlet) is reading on the pump-server side, step 1 always wins
-// and the `pool≈` ≈-symbol can become an `=` because it's no longer a proxy.
+// Pool temp source. Preference depends on EXTERNAL_POOL_TEMP_SENSOR:
+//   external-sensor mode → reflected vDev value > pump inlet > pump outlet
+//   pump mode (default)  → pump inlet > pump outlet > stale vDev value
+// TEMP_INLET (CONFIRMED, block 1000 / addr 1001, 0.1°C precision) is water
+// RETURNING from pool to pump — best single-sensor proxy in pump mode.
+// TEMP_OUTLET is water LEAVING the pump; biased 2-5°C high while heating,
+// equals inlet when pump is off and pipes have equalized.
 const inletFromPump =
   snap && typeof snap.TEMP_INLET === "number" ? snap.TEMP_INLET : null;
 const outletFromPump =
   snap && typeof snap.TEMP_OUTLET === "number" ? snap.TEMP_OUTLET : null;
-const poolTempFromVDev = vDevice.capabilitiesObj?.measure_temperature?.value;
+const vDevPoolTemp = vDevice.capabilitiesObj?.measure_temperature?.value;
+const externalSensorTemp =
+  EXTERNAL_POOL_TEMP_SENSOR && typeof vDevPoolTemp === "number"
+    ? vDevPoolTemp
+    : null;
 const poolTemp =
+  externalSensorTemp ??
   inletFromPump ??
   outletFromPump ??
-  (typeof poolTempFromVDev === "number" ? poolTempFromVDev : null);
-const poolTempIsTrue = inletFromPump !== null; // true = real inlet sensor; false = outlet proxy
+  (typeof vDevPoolTemp === "number" ? vDevPoolTemp : null);
+// "True" = direct water-body sensor (external Zigbee or pump inlet);
+// "false" = outlet proxy or stale vDev value.
+const poolTempIsTrue = externalSensorTemp !== null || inletFromPump !== null;
 
 const decision = decide({
   intentOn,
@@ -497,7 +515,9 @@ if (snap) {
   // makes this update measure_temperature is the DC field's internal
   // mirror config — invisible from outside, but proven by the manual
   // "Set Temperature (Measured) to N" test card the user added.
-  if (typeof poolTemp === "number")
+  // Skipped when EXTERNAL_POOL_TEMP_SENSOR is on: the field is then
+  // Reflect-bound to a dedicated sensor and writing here would fight it.
+  if (!EXTERNAL_POOL_TEMP_SENSOR && typeof poolTemp === "number")
     updates.push(setVField(vDevice, "pool_temp", poolTemp));
   if (typeof snap.TEMP_AMBIENT === "number")
     updates.push(setVField(vDevice, "ambient", snap.TEMP_AMBIENT));
