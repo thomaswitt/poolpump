@@ -42,7 +42,15 @@ RSpec.describe Reprovision do
       def send(cmd, **_)
         @plan_calls << cmd
         raise Reprovision::Timeout, 'expected — module rebooting' if cmd == 'AT+Z'
-        return @error_for[cmd] if @error_for && @error_for.key?(cmd)
+
+        if @error_for && @error_for.key?(cmd)
+          val = @error_for[cmd]
+          # Allow injecting an exception class instead of a return value
+          # (e.g. Reprovision::ModuleError to simulate +ERR=-9 from the module).
+          raise val, "#{cmd} → +ERR=-9 (simulated)" if val.is_a?(Class) && val < Exception
+
+          return val
+        end
         return '' if cmd.include?('=') # SET form
 
         last_set = @plan_calls.reverse.find { |c| c.start_with?("#{cmd}=") }
@@ -89,6 +97,53 @@ RSpec.describe Reprovision do
     it 'uses default port 502 when not specified' do
       Reprovision.commission('10.10.100.254', ssid: 'X', psk: 'Y', server_hostname: 'host')
       expect(plan_calls).to include('AT+NETP=TCP,Client,502,host')
+    end
+
+    it 'softens +ERR on a SET when a downstream verify covers the same setting (DOTELS-SWP firmware quirk)' do
+      # AT+NETP=… raises +ERR=-9 even though the value gets committed
+      # internally. The downstream `verify AT+NETP` confirms the value
+      # — we should proceed to AT+Z, not abort.
+      raise_then_ok = { 'AT+NETP=TCP,Client,5020,host' => Reprovision::ModuleError }
+      allow(Reprovision::Session).to receive(:new) { fake_session_class.new(plan_calls, error_for: raise_then_ok) }
+      Reprovision.commission('10.10.100.254',
+                             ssid: 'X', psk: 'Y',
+                             server_hostname: 'host', port: 5020)
+      expect(plan_calls).to include('AT+Z') # made it to reboot — softened SET didn't abort
+      expect(plan_calls).to include('AT+NETP') # verify still ran
+    end
+
+    it 'still aborts when a softened SET fails its downstream verify (H8 brick-protection)' do
+      # AT+NETP=… raises +ERR (softened), AND the verify-readback comes back
+      # WRONG. Expected behavior: abort before AT+Z.
+      mixed = {
+        'AT+NETP=TCP,Client,5020,host' => Reprovision::ModuleError,
+        'AT+NETP' => 'TCP,Client,5020,wrong-host', # verify fails
+      }
+      allow(Reprovision::Session).to receive(:new) { fake_session_class.new(plan_calls, error_for: mixed) }
+      expect {
+        Reprovision.commission('10.10.100.254',
+                               ssid: 'X', psk: 'Y',
+                               server_hostname: 'host', port: 5020)
+      }.to raise_error(Reprovision::Error, /verify failed for AT\+NETP/)
+      expect(plan_calls).not_to include('AT+Z')
+    end
+
+    it 'does NOT soften +ERR when no downstream verify covers the setting' do
+      # rollback's plan has only [AT+NETP set, AT+NETP verify, AT+Z] — but if
+      # we simulate a tool that issued a SET with no follow-up verify, the
+      # +ERR must propagate. Build a custom plan to exercise apply_plan
+      # directly via the public path… simpler: prove via verify_downstream?
+      # the predicate works. We test the predicate instead — apply_plan's
+      # rescue is a thin call to it.
+      plan = [
+        ['AT+NETP', 'AT+NETP=TCP,Client,5020,host'], # SET
+        ['reboot',  'AT+Z'],                         # no verify in between
+      ]
+      expect(Reprovision.verify_downstream?(plan, 'AT+NETP=TCP,Client,5020,host', 0)).to be(false)
+
+      # And the inverse: WITH a downstream verify of the same field
+      plan_with_verify = plan.dup.insert(1, ['verify', 'AT+NETP', 'TCP,Client,5020,host'])
+      expect(Reprovision.verify_downstream?(plan_with_verify, 'AT+NETP=TCP,Client,5020,host', 0)).to be(true)
     end
   end
 

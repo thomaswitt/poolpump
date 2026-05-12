@@ -100,6 +100,15 @@ module Reprovision
   # into cmd-mode. One socket → one handshake → all commands work.
   class Session
     SETTLE_AFTER_HANDSHAKE = 0.2 # seconds
+    # Bounded recovery drain after a Timeout or ModuleError. The pre-send
+    # `drain_pending` uses select(timeout=0) so it only sees packets
+    # ALREADY in the kernel buffer; a late-arriving response from the
+    # failed command can land between that drain and the next send, then
+    # be picked up as the response to the WRONG command — shifting the
+    # entire session's command/response alignment by one (observed in the
+    # field on the DOTELS-SWP / VER 4.12.14 firmware). 300 ms is enough
+    # to catch any packet the module was about to send when we gave up.
+    DRAIN_AFTER_FAILURE_SEC = 0.3
 
     def initialize(ip)
       @ip = ip
@@ -118,6 +127,9 @@ module Reprovision
       @sock.send("#{command}\r\n", 0, @ip, ASSIST_PORT)
       raw = Reprovision.recv_from(@sock, timeout: timeout, expected_ip: @ip)
       Reprovision.parse_at_response(raw, command)
+    rescue Timeout, ModuleError
+      drain_with_budget(DRAIN_AFTER_FAILURE_SEC)
+      raise
     end
 
     def close
@@ -147,6 +159,23 @@ module Reprovision
       count = 0
       loop do
         break unless IO.select([@sock], nil, nil, 0)
+
+        @sock.recvfrom(RECV_BUFSZ)
+        count += 1
+      end
+      count
+    end
+
+    # Bounded drain — wait up to `budget_sec` for late-arriving packets,
+    # discarding each one. Used after Timeout/ModuleError so the next send
+    # starts with a clean slate.
+    def drain_with_budget(budget_sec)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget_sec
+      count = 0
+      loop do
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        break if remaining <= 0
+        break unless IO.select([@sock], nil, nil, remaining)
 
         @sock.recvfrom(RECV_BUFSZ)
         count += 1
@@ -443,11 +472,31 @@ module Reprovision
         raise unless cmd == 'AT+Z'
 
         puts 'reboot dispatched (no response — expected)'
+      rescue ModuleError => e
+        # Some HF-LPB130 firmwares (DOTELS-SWP / VER 4.12.14, observed in
+        # the field) respond +ERR=-9 to AT+NETP set-commands even when the
+        # value gets committed internally — verified via a subsequent show.
+        # If a downstream `verify` step covers this same setting, defer to
+        # it as the source of truth. H8 brick-protection still holds: a
+        # genuinely uncommitted setting will fail the verify and abort
+        # before AT+Z. Verify steps themselves never get this softening —
+        # if a read raises, it's a real failure.
+        raise if label == 'verify' || !verify_downstream?(plan, cmd, i)
+
+        puts "soft +ERR (#{e.message.split('→').last.strip}); deferring to downstream verify"
       end
     end
     puts 'done. allow ~10 seconds for the module to rejoin WiFi after reboot.'
   ensure
     session&.close
+  end
+
+  # Does the plan have a `verify` step AFTER `current_index` for the same
+  # AT field as `set_cmd`? Used to decide whether a +ERR on a write can be
+  # softened (the verify will catch any real problem before AT+Z runs).
+  def verify_downstream?(plan, set_cmd, current_index)
+    setting = set_cmd.split('=', 2).first # "AT+NETP=foo" → "AT+NETP"
+    plan[(current_index + 1)..].any? { |step| step[0] == 'verify' && step[1] == setting }
   end
 
   # P2 — modules normalize some response casing. AT+NETP is the canonical
