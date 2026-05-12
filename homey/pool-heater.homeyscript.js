@@ -326,13 +326,13 @@ const decide = ({
 // Reconciles four orthogonal aspects, in order:
 //   1. Setpoint - sync user's target_temperature into pump's stored
 //      setpoint via the pure `set-target` verb (no on/off side effects).
-//   2. Model - force STATUS_MODE = 2 (heat). Pool only ever heats; if the
+//   2. Model - force STATUS_MODE = 1 (heat). Pool only ever heats; if the
 //      pump drifted to cool/auto somehow, snap it back. Idempotent.
 //   3. Switch - on/off based on decision.action.
 //   4. Function - silent/smart/boost based on decision.mode (only when on).
 const reconcile = async (decision, snap, targetTemp) => {
   const pumpOn = snap?.SWITCHED_ON === 1 || snap?.SWITCHED_ON === true;
-  const pumpMode = snap?.STATUS_MODE; // 1=cool, 2=heat, 4=auto
+  const pumpMode = snap?.STATUS_MODE; // 1=heat, 2=auto, 4=cool (panel-confirmed)
   const isBoost = snap?.BOOST === 1 || snap?.BOOST === true;
   const isSilent = snap?.SILENCE === 1 || snap?.SILENCE === true;
 
@@ -352,9 +352,9 @@ const reconcile = async (decision, snap, targetTemp) => {
   }
 
   // 2. Model = heat enforcement. Pool only ever heats - if the pump
-  // drifted to cool (STATUS_MODE=1) or auto (4), snap it back. Idempotent
+  // drifted to auto (STATUS_MODE=2) or cool (4), snap it back. Idempotent
   // single-register write via the existing `setmode heat` verb.
-  if (pumpMode !== 2) {
+  if (pumpMode !== 1) {
     await pumpCommand("setmode heat");
     sentVerbs.push("setmode heat");
   }

@@ -98,11 +98,16 @@ module Poolpump
         end
       end
 
-      # Mode register (model field): API uses 1=cool, 2=heat, 4=auto.
-      # CONFIRMED: Modbus side is bit-encoded:
-      #   raw 0x01 = Auto (bit 0), 0x02 = Cool (bit 1), 0x04 = Heat (bit 2).
-      # The bit layout makes the modes mutually-exclusive enums in practice
-      # but leaves room for combined states the firmware might use internally.
+      # Mode register (model field): semantic 1=heat, 2=auto, 4=cool —
+      # CONFIRMED 2026-05-12 by walking the panel through each mode and
+      # reading the post-codec value via /raw. (The earlier "API 1=cool…"
+      # comment was a reverse-engineering error inherited from the cloud
+      # mapping; both reads and writes used the wrong labels symmetrically,
+      # so `setmode heat` was actually setting AUTO etc.)
+      # Modbus side is still bit-encoded:
+      #   raw 0x01 → semantic 4 (cool)
+      #   raw 0x02 → semantic 1 (heat)
+      #   raw 0x04 → semantic 2 (auto)
       class Enum
         def initialize(table) # { raw_value => semantic_value, ... }
           @raw_to_sem = table
@@ -113,9 +118,9 @@ module Poolpump
         def encode(val); @sem_to_raw.fetch(val) { raise ArgumentError, "unknown enum value #{val.inspect}; known: #{@sem_to_raw.keys}" } end
       end
 
-      # API-side `model` semantics: 1=cool, 2=heat, 4=auto.
-      # Modbus side (CONFIRMED via cloud_replay capture):
-      #   raw 0x01 = Auto, raw 0x02 = Cool, raw 0x04 = Heat.
+      # See ModeEnum comment above for the panel-confirmed mapping.
+      # The codec direction (raw → semantic) is unchanged from the original
+      # reverse-engineering; only the human labels at both ends moved.
       ModeEnum = Enum.new(0x01 => 4, 0x02 => 1, 0x04 => 2)
 
       # `function` register stores the bitmask value directly. CONFIRMED
@@ -376,7 +381,7 @@ module Poolpump
       case name
       when :switch then "switch=#{value.to_i == 1 ? 'on' : 'off'}"
       when :model
-        label = { 1 => 'cool', 2 => 'heat', 4 => 'auto' }[value] || "?#{value}*?*"
+        label = { 1 => 'heat', 2 => 'auto', 4 => 'cool' }[value] || "?#{value}*?*"
         "mode=#{label}"
       when :function
         label = case value

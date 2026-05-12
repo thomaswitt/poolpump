@@ -16,10 +16,10 @@ RSpec.describe Poolpump::CommandTranslator do
       expect(described_class.parse('mode-auto').writes).to eq([[:function, 0x0000]])
     end
 
-    it 'parses setmode cool|heat|auto into model writes (API-side semantics)' do
-      expect(described_class.parse('setmode cool').writes).to eq([[:model, 1]])
-      expect(described_class.parse('setmode heat').writes).to eq([[:model, 2]])
-      expect(described_class.parse('setmode auto').writes).to eq([[:model, 4]])
+    it 'parses setmode cool|heat|auto into model writes (panel-confirmed semantics)' do
+      expect(described_class.parse('setmode heat').writes).to eq([[:model, 1]])
+      expect(described_class.parse('setmode auto').writes).to eq([[:model, 2]])
+      expect(described_class.parse('setmode cool').writes).to eq([[:model, 4]])
     end
 
     it 'parses "settemp N" into a single-setpoint sequence (CONFIRMED: device has one setpoint reg, not three)' do
@@ -27,7 +27,7 @@ RSpec.describe Poolpump::CommandTranslator do
       expect(writes).to eq([
                              [:switch, 1],
                              [:settemp, 28],
-                             [:model, 2],
+                             [:model, 1],
                            ])
     end
 
@@ -65,9 +65,9 @@ RSpec.describe Poolpump::CommandTranslator do
       # switch on → raw 1
       switch_entry = reg_writes.find { |_, _, name, _| name == :switch }
       expect(switch_entry[1]).to eq(1)
-      # model heat (API=2) → raw 0x04 (Modbus heat bit)
+      # model heat (semantic=1, panel-confirmed) → raw 0x02
       model_entry = reg_writes.find { |_, _, name, _| name == :model }
-      expect(model_entry[1]).to eq(0x04)
+      expect(model_entry[1]).to eq(0x02)
     end
   end
 end

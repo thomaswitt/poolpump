@@ -70,7 +70,7 @@ def fc41_heartbeat(tid: 0x0aec, uid: 0x01, mac_hex: '001122334455')
 end
 
 # Captured 7-register control block ("at rest") for use as a baseline.
-# Mode=heat (0x04), switch=on (0x01), function=smart (0x0000), setpoint=29.
+# Mode=auto (raw 0x04 → semantic 2), switch=on (0x01), function=smart (0x0000), setpoint=29.
 def control_block_values(model: 0x04, switch: 0x01, function: 0x0000,
                          r2003: 0, r2004: 0, r2005: 0, settemp: 29)
   [model, switch, function, r2003, r2004, r2005, settemp]
@@ -106,7 +106,7 @@ RSpec.describe Poolpump::PumpSession do
       expect(ack.unpack('n n n C C').last).to eq(0x10)
       snap = session.snapshot
       expect(snap[:switch]).to eq(1)
-      expect(snap[:model]).to eq(2)               # raw 0x04 → semantic 2 (heat)
+      expect(snap[:model]).to eq(2)               # raw 0x04 → semantic 2 (auto)
       expect(snap[:settemp]).to eq(29)
     end
 
@@ -177,7 +177,7 @@ RSpec.describe Poolpump::PumpSession do
     end
 
     it 'merges register values across multiple block pushes (control block + raw blocks)' do
-      # First block: control block at addr 2000 (model=heat, on, settemp=29).
+      # First block: control block at addr 2000 (model=auto, on, settemp=29).
       ctl = telemetry_push(control_block_values, start_addr: 0x07d0, tid: 0x01)
       # Second block: arbitrary other addresses preserved as raw_*.
       misc = telemetry_push([0x1234, 0x5678], start_addr: 0x9000, tid: 0x02)

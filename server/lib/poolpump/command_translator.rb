@@ -27,7 +27,9 @@ module Poolpump
     # reconciler needs a side-effect-free version.
     SET_TARGET_RE = /\Aset-target\s+(\d+)\z/
     SETMODE_RE = /\Asetmode\s+(auto|cool|heat)\z/
-    MODE_VALUES = { 'cool' => 1, 'heat' => 2, 'auto' => 4 }.freeze
+    # Semantic values match the panel labels CONFIRMED 2026-05-12 — see
+    # RegisterMap::Codecs::ModeEnum for the raw-byte mapping.
+    MODE_VALUES = { 'heat' => 1, 'auto' => 2, 'cool' => 4 }.freeze
     # The Acquasource i-Series manual section 6 defines:
     #   * Setting range — heating: 15-40°C, cooling: 8-25°C
     #   * Operating ambient: -15°C to 43°C
@@ -77,7 +79,7 @@ module Poolpump
         Command.new(verb: verb, writes: [
                       [:switch, 1],
                       [:settemp, n],
-                      [:model, 2],
+                      [:model, MODE_VALUES.fetch('heat')],
                     ])
       when SET_TARGET_RE
         n = Integer(::Regexp.last_match(1))

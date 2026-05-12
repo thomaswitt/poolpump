@@ -36,17 +36,18 @@ RSpec.describe Poolpump::RegisterMap do
   end
 
   describe Poolpump::RegisterMap::Codecs::ModeEnum do
-    it 'maps API model values to the confirmed Modbus bitmask values' do
-      # API: 1=cool, 2=heat, 4=auto. Modbus: 0x01=auto, 0x02=cool, 0x04=heat.
-      expect(described_class.encode(1)).to eq(0x02) # cool
-      expect(described_class.encode(2)).to eq(0x04) # heat
-      expect(described_class.encode(4)).to eq(0x01) # auto
+    it 'maps semantic model values to the confirmed Modbus bitmask values' do
+      # Panel-confirmed 2026-05-12: semantic 1=heat, 2=auto, 4=cool.
+      # Codec direction unchanged from original RE; only labels were wrong.
+      expect(described_class.encode(1)).to eq(0x02) # heat
+      expect(described_class.encode(2)).to eq(0x04) # auto
+      expect(described_class.encode(4)).to eq(0x01) # cool
     end
 
-    it 'decodes Modbus bitmask values back to API model values' do
-      expect(described_class.decode(0x01)).to eq(4) # auto
-      expect(described_class.decode(0x02)).to eq(1) # cool
-      expect(described_class.decode(0x04)).to eq(2) # heat
+    it 'decodes Modbus bitmask values back to semantic model values' do
+      expect(described_class.decode(0x01)).to eq(4) # cool
+      expect(described_class.decode(0x02)).to eq(1) # heat
+      expect(described_class.decode(0x04)).to eq(2) # auto
     end
 
     it 'raises on unknown semantic values' do
@@ -59,7 +60,7 @@ RSpec.describe Poolpump::RegisterMap do
       # Layout: model, switch, function, ?, ?, ?, settemp (regs 2000..2006)
       values = [0x04, 0x01, 0x0010, 0, 0, 0, 28]
       decoded = described_class.decode_block(Poolpump::RegisterMap::TELEMETRY_BLOCK_START, values)
-      expect(decoded[:model]).to eq(2)        # raw 0x04 → semantic 2 (heat)
+      expect(decoded[:model]).to eq(2)        # raw 0x04 → semantic 2 (auto)
       expect(decoded[:switch]).to eq(1)
       expect(decoded[:function]).to eq(0x0010) # raw passes through (silent bit)
       expect(decoded[:settemp]).to eq(28)
@@ -196,13 +197,13 @@ RSpec.describe Poolpump::RegisterMap do
       expect(raw).to eq(30)
     end
 
-    it 'encodes API mode 2 (heat) as Modbus raw 0x04' do
+    it 'encodes semantic mode 2 (auto) as Modbus raw 0x04' do
       addr, raw = described_class.encode_write(:model, 2)
       expect(addr).to eq(0x07d0)
       expect(raw).to eq(0x04)
     end
 
-    it 'encodes API mode 4 (auto) as Modbus raw 0x01' do
+    it 'encodes semantic mode 4 (cool) as Modbus raw 0x01' do
       _addr, raw = described_class.encode_write(:model, 4)
       expect(raw).to eq(0x01)
     end
