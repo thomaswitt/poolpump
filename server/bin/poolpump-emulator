@@ -86,16 +86,30 @@ Sync do |task|
     # "armed" not "enabled" — past-tense "enabled" reads ambiguously, as if
     # the watchdog just *fired*. "armed" makes the passive ready-state
     # obvious to operators skimming the startup banner.
+    cold_threshold_sec = AUTO_REBOOT_AFTER_SEC * 2
     LOGGER.call("[watchdog] armed — will auto-reboot if telemetry goes stale for >#{AUTO_REBOOT_AFTER_SEC.to_i}s " \
-                "(cooldown #{AUTO_REBOOT_COOLDOWN_SEC.to_i}s, daily cap #{AUTO_REBOOT_DAILY_LIMIT})")
+                "(or never seen since boot for >#{cold_threshold_sec.to_i}s); " \
+                "cooldown #{AUTO_REBOOT_COOLDOWN_SEC.to_i}s, daily cap #{AUTO_REBOOT_DAILY_LIMIT}")
+    boot_monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     task.async do
       loop do
         sleep WATCHDOG_TICK_SEC
         hz = session.healthz
         age = hz[:snapshot_age_sec]
-        next unless age && age > AUTO_REBOOT_AFTER_SEC
+        if age
+          next unless age > AUTO_REBOOT_AFTER_SEC
 
-        reboot_controller.reboot!(reason: "watchdog: snapshot_age=#{age.to_i}s > #{AUTO_REBOOT_AFTER_SEC.to_i}s")
+          reboot_controller.reboot!(reason: "watchdog: snapshot_age=#{age.to_i}s > #{AUTO_REBOOT_AFTER_SEC.to_i}s")
+        else
+          # Cold-boot fallback: @last_snapshot_at stays nil when the module
+          # never reconnects after our restart, so the warm path above never
+          # fires. Observed in production: container ran 5 days with
+          # attempts_today=0 because the module was wedged across the boot.
+          uptime = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - boot_monotonic).round
+          next unless uptime > cold_threshold_sec
+
+          reboot_controller.reboot!(reason: "watchdog: no telemetry since boot (uptime=#{uptime}s > #{cold_threshold_sec.to_i}s)")
+        end
       rescue StandardError => e
         LOGGER.call("[watchdog] tick error #{e.class}: #{e.message}")
       end
