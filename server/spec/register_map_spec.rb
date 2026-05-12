@@ -107,11 +107,11 @@ RSpec.describe Poolpump::RegisterMap do
       expect(decoded[:pa17]).to eq(230)
     end
 
-    it 'exposes regs 2003-2005 (purpose unknown) as raw_07d3..raw_07d5' do
+    it 'exposes regs 2003 + 2005 (purpose unknown) as raw_07d3 / raw_07d5; 2004 = panel_settemp (CONFIRMED)' do
       values = [0x01, 0x01, 0x0000, 9, 28, 45, 30]
       decoded = described_class.decode_block(Poolpump::RegisterMap::TELEMETRY_BLOCK_START, values)
       expect(decoded[:raw_07d3]).to eq(9)
-      expect(decoded[:raw_07d4]).to eq(28)
+      expect(decoded[:panel_settemp]).to eq(28)
       expect(decoded[:raw_07d5]).to eq(45)
     end
   end

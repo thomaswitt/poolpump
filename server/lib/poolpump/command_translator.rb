@@ -71,14 +71,17 @@ module Poolpump
         n = Integer(::Regexp.last_match(1))
         raise ParseError, "settemp value #{n} out of range #{TEMP_BOUNDS}" unless TEMP_BOUNDS.cover?(n)
 
-        # The device has ONE setpoint register (CONFIRMED) — the legacy
-        # 5-write sequence (switch+autotemp+cooltemp+heattemp+model=heat) is
-        # collapsed to: turn on, set the single setpoint, switch to heat.
+        # The device has ONE active setpoint register (settemp = 0x07d6,
+        # what the compressor follows). The legacy 5-write sequence
+        # (switch+autotemp+cooltemp+heattemp+model=heat) is collapsed to:
+        # turn on, set the active setpoint, also write panel-display
+        # setpoint (0x07d4) so the LCD follows, switch to heat.
         # M1 — function is intentionally NOT reset to 0 here, preserving any
         # active boost/silence the user explicitly enabled.
         Command.new(verb: verb, writes: [
                       [:switch, 1],
                       [:settemp, n],
+                      [:panel_settemp, n],
                       [:model, MODE_VALUES.fetch('heat')],
                     ])
       when SET_TARGET_RE
@@ -89,7 +92,10 @@ module Poolpump
         # Used by the Homey reconciler to keep the pump's stored setpoint
         # in sync with the user's `target_temperature` intent without
         # accidentally turning the pump on or flipping it to heat mode.
-        Command.new(verb: verb, writes: [[:settemp, n]])
+        # We also mirror to panel_settemp (0x07d4) so the panel LCD follows
+        # the app's target — otherwise the panel would keep showing the
+        # last value set via its own buttons, diverging from app intent.
+        Command.new(verb: verb, writes: [[:settemp, n], [:panel_settemp, n]])
       else
         raise ParseError, "unknown verb: #{verb.inspect}"
       end

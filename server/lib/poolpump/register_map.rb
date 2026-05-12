@@ -175,7 +175,12 @@ module Poolpump
       Definition.new(name: :model,    read_address: 0x07d0, write_address: 0x07d0, codec: Codecs::ModeEnum, confidence: :CONFIRMED),
       Definition.new(name: :switch,   read_address: 0x07d1, write_address: 0x07d1, codec: Codecs::Bool,     confidence: :CONFIRMED),
       Definition.new(name: :function, read_address: 0x07d2, write_address: 0x07d2, codec: Codecs::Identity, confidence: :CONFIRMED), # raw bitmask: 0x0000=smart, 0x0010=silent, 0x0400=boost
-      # regs 2003-2005 captured as 9, 28, 45 in baseline — purpose unknown, exposed as raw.
+      # reg 2003 (raw_07d3) and 2005 (raw_07d5) captured as 9 and 45 in baseline — purpose unknown, exposed as raw.
+      # reg 2004 = panel-displayed setpoint °C — CONFIRMED 2026-05-12 by walking the panel
+      # 23→25→27 and watching this register move in lockstep on each control-block push (~30s cadence).
+      # The compressor uses :settemp (0x07d6) for actual control; this register is what the LCD shows.
+      # We write both addresses on cloud setpoint changes so the panel display follows the app.
+      Definition.new(name: :panel_settemp, read_address: 0x07d4, write_address: 0x07d4, codec: Codecs::Identity, confidence: :CONFIRMED),
       Definition.new(name: :settemp,  read_address: 0x07d6, write_address: 0x07d6, codec: Codecs::Identity, confidence: :CONFIRMED),
 
       # ── Read-only sensors — PQ Parameter Table (block 300) ─────────────
@@ -359,7 +364,7 @@ module Poolpump
     # means cool-position vs heat-position). Showing `valve=1` is worse
     # than showing nothing because it implies meaningful info. Add back
     # once we decode the bit.
-    HUMANIZE_ORDER = %i[switch model function settemp ap2 ap3 pa10 ap8 pa15 pa16 pa17 pa22 pa23 pa13].freeze
+    HUMANIZE_ORDER = %i[switch model function settemp panel_settemp ap2 ap3 pa10 ap8 pa15 pa16 pa17 pa22 pa23 pa13].freeze
 
     # i25 specs from manual section 3 (page 11):
     #   Max input:    4.49 kW          (hard system ceiling)
@@ -392,6 +397,7 @@ module Poolpump
         end
         "fn=#{label}"
       when :settemp  then "set=#{value}°C#{value < 15 || value > 32 ? '*?*' : ''}"
+      when :panel_settemp then "panel=#{value}°C#{value < 15 || value > 32 ? '*?*' : ''}"
       when :ap2      then "ambient=#{value}°C#{value < -20 || value > 50 ? '*?*' : ''}"
       when :ap3      then "outlet=#{value}°C#{value < -10 || value > 60 ? '*?*' : ''}"
       when :pa10     then "inlet=#{value}°C#{value < -10 || value > 60 ? '*?*' : ''}"

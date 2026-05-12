@@ -22,13 +22,21 @@ RSpec.describe Poolpump::CommandTranslator do
       expect(described_class.parse('setmode cool').writes).to eq([[:model, 4]])
     end
 
-    it 'parses "settemp N" into a single-setpoint sequence (CONFIRMED: device has one setpoint reg, not three)' do
+    it 'parses "settemp N" into a single-setpoint sequence (active + panel display + heat mode)' do
       writes = described_class.parse('settemp 28').writes
       expect(writes).to eq([
                              [:switch, 1],
                              [:settemp, 28],
+                             [:panel_settemp, 28],
                              [:model, 1],
                            ])
+    end
+
+    it 'parses "set-target N" as the pure setpoint pair (active + panel) without side effects' do
+      expect(described_class.parse('set-target 26').writes).to eq([
+                                                                    [:settemp, 26],
+                                                                    [:panel_settemp, 26],
+                                                                  ])
     end
 
     it 'rejects out-of-range settemp values (15..32 — heating-mode floor + comfort/efficiency ceiling)' do
