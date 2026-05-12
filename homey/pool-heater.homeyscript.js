@@ -67,21 +67,28 @@ const EXTERNAL_POOL_TEMP_SENSOR = true;
 
 // Capability field IDs on the existing DeviceCapabilities-app virtual device.
 // Discovered by inspecting `Homey.devices.getDevices()` state:
-//   number3 Ambient, number4 Compressor, number5 Outlet, number6 Target Set
+//   number3 Ambient, number4 Compressor, number5 Outlet,
+//   number6 Power Consumption (Show-As measure_power → Insights "Power Usage")
 //   text1 Last Updated, text2 OperatingStatus, boolean1/2 Power/Boost intents.
 //
 // Pool temperature is NOT a DeviceCapabilities custom field on this device
 // (despite what the old flow assumed) - it's the standard Homey
 // `measure_temperature` capability that renders on the tile. Written via
 // direct `setCapabilityValue` below, not through `runFlowCardAction`.
+//
+// Number slot history:
+//   number1 was "Temperature (Measured)" (Show-As measure_temperature). With
+//     EXTERNAL_POOL_TEMP_SENSOR=true the field is now Reflect-bound to the
+//     dedicated Zigbee thermometer and we never write it.
+//   number6 was "Target Temperature Set" (duplicate of target_temperature);
+//     slot was reused for Power Consumption after that field was deleted.
 const VFIELD = {
   power_intent: { id: "boolean1", name: "Power" },
   boost_intent: { id: "boolean2", name: "Boost Mode" },
-  pool_temp: { id: "number1", name: "Temperature (Measured)" }, // mirrors to standard measure_temperature → gauge "Current temperature"
   ambient: { id: "number3", name: "Ambient Temperature" },
   compressor: { id: "number4", name: "Compressor Rate" },
   outlet: { id: "number5", name: "Outlet Temperature" },
-  target_set: { id: "number6", name: "Target Temperature Set" },
+  power_w: { id: "number6", name: "Power Consumption" },
   last_updated: { id: "text1", name: "Last Updated" },
   operating_status: { id: "text2", name: "OperatingStatus" },
   // mode list (list1) removed from device — pool only ever heats,
@@ -525,8 +532,20 @@ if (snap) {
     updates.push(setVField(vDevice, "outlet", snap.TEMP_OUTLET));
   if (typeof snap.COMPRESSOR_RATE === "number")
     updates.push(setVField(vDevice, "compressor", snap.COMPRESSOR_RATE));
-  if (typeof snap.TEMP_TARGET === "number")
-    updates.push(setVField(vDevice, "target_set", snap.TEMP_TARGET));
+  // Power consumption estimate (W). Calibration 2026-05-12 against the
+  // house grid meter delta (pool on - off = 1.80 kW at compressor 50%,
+  // DC_LINK 355V × 6A): V_dc × I_dc × 0.85 predicted 1810 W (0.6% match).
+  // BLL field is Show-As = Power (measure_power), so the value also shows
+  // up under "Power Usage" in Insights — same data, two display contexts.
+  // Falls back nil if either DC sensor is absent (pump just reconnected,
+  // sensor block not yet pushed, etc.).
+  const powerW =
+    typeof snap.DC_LINK_VOLTAGE_V === "number" &&
+    typeof snap.DC_LINK_CURRENT_A === "number"
+      ? Math.round(snap.DC_LINK_VOLTAGE_V * snap.DC_LINK_CURRENT_A * 0.85)
+      : null;
+  if (typeof powerW === "number")
+    updates.push(setVField(vDevice, "power_w", powerW));
   // Pool-temp display: the device's `measure_temperature` is a read-only
   // mirror of the DeviceCapabilities Status field
   // (measure_devicecapabilities_number-custom_26.status1) - direct

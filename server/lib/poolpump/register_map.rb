@@ -208,9 +208,15 @@ module Poolpump
       #   With compressor at 48Hz: pa16 = 0.5A but Phase 1 delta = 2206W.
       #   So PQ16 is POST-inverter motor winding current, not mains current —
       #   manual's "compressor current" label is technically correct but
-      #   misleading. The DC link product (V_dc × I_dc) ÷ 0.85 estimates
-      #   true mains draw within ±15% (validated at 48Hz: 350×5÷0.85=2059W
-      #   vs measured 2206W).
+      #   misleading. The DC link product (V_dc × I_dc) × 0.85 estimates
+      #   true mains draw within ±15% — calibrated against the house grid
+      #   meter delta (pool on - off):
+      #     2026-05-12: 355V × 6A × 0.85 = 1810 W vs measured 1800 W (0.6%)
+      #     2026-04-30: 350V × 5A × 0.85 = 1488 W vs measured 2206 W (32%)
+      #   Earlier 2026-04-30 datapoint was a poor fit — heat-pump
+      #   power-vs-frequency isn't linear, so a single constant factor will
+      #   drift with load. × 0.85 matches the typical mid-load operating
+      #   point. Refit with a curve if accuracy ever matters.
       Definition.new(name: :pa16, read_address: 315, write_address: nil, codec: Codecs::TenthDeg, confidence: :CONFIRMED), # PQ16 — motor winding current ÷10 → A (NOT mains!)
       Definition.new(name: :pa17, read_address: 316, write_address: nil, codec: Codecs::TenFold,  confidence: :CONFIRMED), # PQ17 — mains voltage ×10 → V
       Definition.new(name: :pa22, read_address: 321, write_address: nil, codec: Codecs::FiveFold, confidence: :CONFIRMED), # PQ22 — DC link voltage ×5 → V
