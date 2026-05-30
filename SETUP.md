@@ -274,10 +274,12 @@ That's how the existing register map at addr 2000-2006 was decoded.
 The read-only sensor addresses (TEMP_AMBIENT/INLET/OUTLET,
 COMPRESSOR_RATE, STATUS_WATERPUMP, STATUS_OPERATION) are `:CONFIRMED`
 against the manual's PQ Parameter Table at register block 300 plus the
-`water_io` block at 1000. The fault aggregator (`pa13`, addr 500) is
-still `:HYPOTHESIZED` — bit-by-bit decoding to map P01-P11 / E01-E51
-needs a no-fault baseline (pool refilled) to diff against the current
-P01 capture. Workflow:
+`water_io` block at 1000. The long-assumed fault register (`pa13`, addr
+500) was REFUTED 2026-05-30: it reads `1` both while healthy and during a
+real P01, so it carries no fault information and `STATUS_MALFUNC` no longer
+derives from it (it returns `"none"`). Locating the true live-fault
+register needs a telemetry capture DURING a genuine fault, diffed against
+the healthy baseline already captured. Workflow:
 
 ```bash
 ruby tools/sniff.rb > _data/baseline.log

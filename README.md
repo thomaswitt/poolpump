@@ -74,10 +74,12 @@ cd server && bundle install && bundle exec rspec
 - Port 502 needs root outside Docker. Inside Docker, no.
 - The HTTP API on :8090 has no auth and no TLS. LAN only.
 - Control registers (mode / on-off / function / setpoint) are CONFIRMED.
-- Read-only sensors are mostly CONFIRMED via the manual's PQ table;
-  `STATUS_MALFUNC` returns the full code+description when known (e.g.
-  `"P01: Water flow protection - …"`) and `"FAULT (unknown raw=N)"` for
-  codes we haven't mapped yet.
+- Read-only sensors are mostly CONFIRMED via the manual's PQ table.
+  `STATUS_MALFUNC` currently always reports `"none"`: register 500 (the
+  long-assumed fault register) was refuted 2026-05-30 — it reads `1` both
+  while healthy and during a real P01 — so no fault code is derived from it
+  until the true live-fault register is found. See `fault_label` in
+  `server/lib/poolpump/register_map.rb`.
 
 ## Further Reading / related repos
 

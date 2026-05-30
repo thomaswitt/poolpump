@@ -36,7 +36,7 @@ module Poolpump
     BLOCK_NAMES = {
       0x07d0 => 'control',     # 7 regs:  switch, model, function, ?, ?, ?, settemp
       0x012c => 'sensors',     # 27 regs: PQ Parameter Table (manual section 10)
-      0x01f4 => 'alarms',      # 61 regs: fault/protection bitmap (P/E codes; bit layout TODO)
+      0x01f4 => 'alarms',      # 61 regs: purpose UNCONFIRMED — reg 500 is NOT a fault code (reads 1 healthy+faulted, refuted 2026-05-30); layout TBD
       0x0258 => 'submode',     # 27 regs: sub-mode + timer states (HYPOTHESIZED)
       0x03e8 => 'water_io',    # 8  regs: inlet+outlet temps at 0.1°C precision (CONFIRMED)
       0x0064 => 'config1',     # 61 regs: config/limits (HYPOTHESIZED)

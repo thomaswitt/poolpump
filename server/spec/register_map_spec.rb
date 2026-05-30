@@ -168,19 +168,17 @@ RSpec.describe Poolpump::RegisterMap do
       expect(snap['SILENCE']).to be_nil
     end
 
-    it 'reports STATUS_MALFUNC as the full code+description when pa13 is in the validated P-code range (1-7)' do
-      snap = described_class.semantic_snapshot(pa13: 1)
-      expect(snap['STATUS_MALFUNC']).to start_with('P01: Water flow protection')
+    it 'reports STATUS_MALFUNC as "none" regardless of reg 500 (pa13) value' do
+      # reg 500 reads 1 both during a real P01 (2026-04-30) and while the pump
+      # is healthy (2026-05-30), so its scalar carries no fault information —
+      # we never derive a P/E code from it. See RegisterMap.fault_label.
+      expect(described_class.semantic_snapshot(pa13: 0)['STATUS_MALFUNC']).to eq('none')
+      expect(described_class.semantic_snapshot(pa13: 1)['STATUS_MALFUNC']).to eq('none')
+      expect(described_class.semantic_snapshot(pa13: 42)['STATUS_MALFUNC']).to eq('none')
     end
 
-    it 'reports STATUS_MALFUNC as "FAULT (unknown raw=N)" for codes outside the validated range (E-codes TBD)' do
-      snap = described_class.semantic_snapshot(pa13: 42)
-      expect(snap['STATUS_MALFUNC']).to start_with('FAULT (unknown raw=42)')
-    end
-
-    it 'reports STATUS_MALFUNC as "none" when fault aggregator is zero' do
-      snap = described_class.semantic_snapshot(pa13: 0)
-      expect(snap['STATUS_MALFUNC']).to eq('none')
+    it 'leaves STATUS_MALFUNC nil when pa13 is absent (no telemetry yet)' do
+      expect(described_class.semantic_snapshot({})['STATUS_MALFUNC']).to be_nil
     end
   end
 

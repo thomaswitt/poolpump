@@ -163,8 +163,11 @@ module Poolpump
     #                         reg 316 decoded to raw 23 → 230V mains, and
     #                         reg 321 to raw 64 → 320V DC link — physically
     #                         correct for European single-phase install.)
-    #   addr 500  (61 regs) — alarm/protection bitmap (HYPOTHESIZED — fault
-    #                         bit isolation needs no-fault baseline diff).
+    #   addr 500  (61 regs) — purpose UNCONFIRMED. Long assumed an
+    #                         alarm/protection bitmap, but reg 500 itself is
+    #                         NOT a fault indicator: it reads 1 both healthy
+    #                         and faulted (refuted 2026-05-30). Block layout
+    #                         TBD; STATUS_MALFUNC no longer derives from it.
     #   addr 600  (27 regs) — sub-mode states (HYPOTHESIZED).
     #   addr 1000 (8  regs) — counters (rare cadence; HYPOTHESIZED).
     #   addr 2000 (7  regs) — control state (CONFIRMED — see above).
@@ -234,12 +237,18 @@ module Poolpump
       # field for it.
       Definition.new(name: :pa10, read_address: 1001, write_address: nil, codec: Codecs::TenthDeg, confidence: :CONFIRMED),
 
-      # ── Fault aggregator (block 500, 61 booleans) ──────────────────────
-      # HYPOTHESIZED address: reg 500 itself — the captured baseline shows
-      # value 1 at this offset which is consistent with "any fault active"
-      # given Poolpump is in P01 (water flow) right now. Bit-by-bit decoding
-      # to map P01-P11 / E01-E51 needs a no-fault baseline (pool refilled)
-      # to diff against the current P01 capture.
+      # ── reg 500 — NOT a usable fault signal (kept for forensics) ───────
+      # The vendor app names pa13 "Unit malfunction", so this register is
+      # *semantically* fault-related — but its scalar value carries no fault
+      # information for us: it reads 1 BOTH during a real P01 (2026-04-30
+      # capture) AND while the pump is healthy and actively heating
+      # (2026-05-30 capture, fresh telemetry). Same value in faulted vs
+      # healthy ⇒ the old "raw 1 ⇒ P01" mapping was a single-point
+      # coincidence, now refuted by a healthy baseline. We keep the
+      # definition only so reg 500 (and its raw_01f5.. neighbours) stay
+      # visible in /raw for the future capture-during-genuine-fault diff
+      # that would finally locate the real live-fault register/encoding.
+      # fault_label deliberately ignores this value — see its note.
       Definition.new(name: :pa13, read_address: 500, write_address: nil, codec: Codecs::Identity, confidence: :HYPOTHESIZED),
     ].freeze
 
@@ -415,12 +424,9 @@ module Poolpump
       when :pa23     then "Idc=#{value}A"
       when :pb11     then "valve=#{value}"
       when :pa13
-        if value.to_i.zero?
-          'fault=ok'
-        else
-          name = FAULT_RAW_TO_NAME[value.to_i]
-          name ? "fault=#{name}*?*" : "fault=raw#{value}*?*"
-        end
+        # reg 500 is not a usable fault signal (see fault_label) — surface
+        # the raw value for forensics, but never claim a P/E code from it.
+        "reg500=#{value}"
       end
     end
 
@@ -487,34 +493,37 @@ module Poolpump
       'E51' => 'Communication failure of fan motor — incorrect wire connection or IPM failure. Check wires; reconnect or change IPM.',
     }.freeze
 
-    # raw pa13 value → code-name mapping.
-    # P-codes 1-7: VALIDATED (pump in known P01 → pa13=1 ✓).
-    # E-codes: encoding TBD — when an E-code shows up on the panel and pa13
-    # has a corresponding raw value, add it here. Until then, fault_label
-    # returns "FAULT (unknown raw=N)" with the dictionary printable for
-    # forensics so the operator can cross-reference manually.
-    FAULT_RAW_TO_NAME = {
-      1 => 'P01', 2 => 'P02', 3 => 'P03', 4 => 'P04',
-      5 => 'P05', 6 => 'P06', 7 => 'P07',
-      # E-codes: extend as observed.
-    }.freeze
+    # NOTE: the former FAULT_RAW_TO_NAME ordinal table ({1=>P01,..7=>P07})
+    # was removed 2026-05-30. It was never externally grounded (the vendor
+    # app carries pa13 as an opaque string, not an ordinal) and was refuted
+    # empirically: reg 500 reads 1 while the pump is healthy. When a real
+    # fault encoding is found, reintroduce a mapping here and wire it into
+    # fault_label, using FAULT_CODES_BY_NAME (above) for the descriptions.
 
-    # Returns one of:
-    #   nil                                  — no telemetry yet
-    #   'none'                               — no active fault
-    #   'P01: Water flow protection — ...'   — known code (full description)
-    #   'FAULT (unknown raw=42)'             — pa13 has a value we haven't
-    #                                          mapped yet; check pump panel
+    # STATUS_MALFUNC derivation.
+    #
+    # We do NOT decode register 500 (pa13) into a P/E code. Its value is 1
+    # in both faulted (P01, 2026-04-30) and healthy (2026-05-30) captures, so
+    # it carries no fault information; the old ordinal table {1=>P01,..} was a
+    # single-point coincidence, now refuted by a healthy baseline. The vendor
+    # app confirms pa13 means "Unit malfunction" but transports it as an
+    # opaque cloud-supplied STRING and never derives an integer→P-code, so
+    # there was no external basis for the ordinal either.
+    #
+    # Until a genuine-fault telemetry capture (diffed against the healthy
+    # baseline we now have) locates the real live-fault register/encoding, we
+    # report 'none' rather than fabricate a code. Raw reg 500 stays in /raw
+    # for that diff; FAULT_CODES_BY_NAME is retained as the manual's reference
+    # dictionary for when a confirmed mapping exists.
+    #
+    # Returns:
+    #   nil      — no telemetry yet (pa13 absent)
+    #   'none'   — telemetry present; no fault asserted (reg 500 is not a
+    #              trustworthy fault source — see above)
     def fault_label(raw)
       return nil if raw.nil?
-      n = raw.to_i
-      return 'none' if n.zero?
 
-      name = FAULT_RAW_TO_NAME[n]
-      return "FAULT (unknown raw=#{n}) — check pump panel for code, see manual §13" unless name
-
-      desc = FAULT_CODES_BY_NAME[name]
-      "#{name}: #{desc}"
+      'none'
     end
   end
 end
