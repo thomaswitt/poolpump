@@ -13,7 +13,7 @@
  *   from device-toggle triggers.
  *
  * Strategy:
- *   - Heat only when ambient >= 22C AND time in 10:00..17:00 local.
+ *   - Heat only when ambient >= 22C AND time in 09:00..17:00 local.
  *   - Mode: silent by default (highest COP, lowest draw). Smart-upgrade
  *     on a wide gap is gated by SMART_GAP_C — set to 0 to disable
  *     entirely (the energy-saving default). Boost is the user override
@@ -42,8 +42,8 @@ const TIMEZONE = "Europe/Nicosia";
 // Strategy thresholds (see project_pool_heat_strategy.md).
 const AMBIENT_HARD_FLOOR_C = 18; // below this: never heat
 const AMBIENT_SOFT_FLOOR_C = 22; // below this in window: only with explicit boost
-const HEATING_WINDOW_START_H = 10; // local time
-const HEATING_WINDOW_END_H = 17;
+const HEATING_WINDOW_START_H = 9; // local time
+const HEATING_WINDOW_END_H = 15;
 const TARGET_HYSTERESIS_C = 0.5; // stop heating when pool >= target + this; resume when <= target - this
 // Smart-mode upgrade threshold: if (target - pool) > SMART_GAP_C, upgrade
 // silent → smart for faster heat at higher consumption.
