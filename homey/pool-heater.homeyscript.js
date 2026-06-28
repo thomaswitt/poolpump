@@ -13,13 +13,14 @@
  *   from device-toggle triggers.
  *
  * Strategy:
- *   - Heat only when ambient >= 22C AND time in 09:00..17:00 local.
+ *   - Heat only when ambient >= 22C AND time in 09:00..15:00 local.
  *   - Mode: silent by default (highest COP, lowest draw). Smart-upgrade
  *     on a wide gap is gated by SMART_GAP_C — set to 0 to disable
  *     entirely (the energy-saving default). Boost is the user override
  *     for faster, more-expensive heating.
- *   - Stop when pool >= target + hysteresis (avoids on/off thrash).
- *   - Hard floor: ambient < 18C never heats, even if intent ON.
+ *   - Stop when pool >= target + hysteresis; resume only once pool has
+ *     fallen to <= target - hysteresis (real deadband — avoids on/off thrash).
+ *   - Hard floor: ambient < 18C never heats, even if intent ON or Boost ON.
  */
 "use strict";
 
@@ -35,8 +36,8 @@ const NETATMO_OUTDOOR_NAME = " Netatmo Terrasse";
 
 // Local timezone for time-of-day decisions and the `Last Updated` text.
 // HomeyScript runs on Athom Cloud where Date defaults to UTC; without an
-// explicit zone, our heating window (11-17 local) would be evaluated in
-// UTC = 14-20, which is wrong.
+// explicit zone, our heating window (9-15 local) would be evaluated in
+// UTC = 6-12 (summer, UTC+3), which is wrong.
 const TIMEZONE = "Europe/Nicosia";
 
 // Strategy thresholds (see project_pool_heat_strategy.md).
@@ -241,21 +242,30 @@ const inHeatingWindow = (date) => {
  *
  * Precedence (top wins):
  *   1. Power OFF                → idle (kill switch)
- *   2. Pool already at target   → idle (even Boost respects this — once hot
- *                                  enough, no point burning more energy;
- *                                  hysteresis band prevents on/off thrash)
- *   3. Boost ON                 → HEAT (boost mode), skips ALL weather/time
- *                                  gates. "Heat now, I want the pool warm
- *                                  fast — I'll pay for it."
- *   4. Hard floor (ambient<18)  → idle (compressor protection — Boost can't
- *                                  override this; the pump itself refuses
- *                                  to run at <-15 ambient and gets unhappy
- *                                  in low single digits)
- *   5. Outside heating window   → idle (only economic gate that's a hard
- *                                  block when Boost OFF; Cyprus nights at
- *                                  600m kill COP regardless of ambient)
- *   6. Soft floor (ambient<22)  → idle (suggests Boost as the override path)
- *   7. Otherwise                → HEAT, mode by gap-to-target
+ *   2. Pool >= target + hyst    → idle (UPPER bound — even Boost respects
+ *                                  this; once hot enough, no point burning
+ *                                  more energy)
+ *   3. Hard floor (ambient<18)  → idle (compressor protection — even Boost
+ *                                  respects this; below ~18°C COP is awful and
+ *                                  defrost cycles eat energy. Placed BEFORE
+ *                                  Boost so "heat now" can't drag the pump into
+ *                                  cold-weather operation.)
+ *   4. Boost ON                 → HEAT (boost mode). Skips the heating window,
+ *                                  the soft floor, AND the deadband hold below.
+ *                                  "Heat now, I'll pay for it." Still bounded by
+ *                                  steps 2 (upper) and 3 (hard floor).
+ *   5. Deadband hold            → idle when currently OFF and pool is still
+ *                                  above target - hyst. Second half of the
+ *                                  hysteresis: after stopping at the upper
+ *                                  bound, stay off while cooling until pool
+ *                                  drops to target - hyst, then resume. Prevents
+ *                                  on/off thrash. If currently HEATING (or pool
+ *                                  already <= target - hyst) it falls through
+ *                                  and keeps/starts heating.
+ *   6. Outside heating window   → idle (Cyprus nights/mornings at 600m kill
+ *                                  COP regardless of ambient)
+ *   7. Soft floor (ambient<22)  → idle (suggests Boost as the override path)
+ *   8. Otherwise                → HEAT, mode by gap-to-target
  *
  * Note: under Boost, the cron tick reaffirms heat each cycle, so the
  * 5-min reconciler does NOT fight the user — it just keeps re-sending
@@ -267,12 +277,13 @@ const decide = ({
   ambient,
   poolTemp,
   targetTemp,
+  heatingNow,
   now,
 }) => {
   // 1. Power OFF — kill switch, overrides everything.
   if (!intentOn) return { action: "idle", mode: null, reason: "intent OFF" };
 
-  // 2. Pool already at target — even Boost stops here.
+  // 2. Upper bound — pool hot enough, stop. Even Boost stops here.
   if (
     typeof poolTemp === "number" &&
     poolTemp >= targetTemp + TARGET_HYSTERESIS_C
@@ -284,19 +295,10 @@ const decide = ({
     };
   }
 
-  // 3. Boost = "heat now, ignore weather/time". User opt-in to inefficient
-  // heating in exchange for speed. Skips both floors AND the heating window.
-  if (boostOverride) {
-    return {
-      action: "heat",
-      mode: "boost",
-      reason: `BOOST: heating to ${targetTemp}°C, ignoring weather/time`,
-    };
-  }
-
-  // 4. Hard floor — true compressor protection, even Boost shouldn't push
-  // the pump below this ambient (manual: pump operates -15..43°C; below
-  // ~18°C COP is awful AND defrost cycles start eating energy).
+  // 3. Hard floor — true compressor protection. Even Boost respects this:
+  // below ~18°C ambient the COP is awful and defrost cycles start eating
+  // energy (manual: pump operates -15..43°C). Placed BEFORE Boost so "heat
+  // now" can't drag the pump into cold-weather operation.
   if (ambient < AMBIENT_HARD_FLOOR_C)
     return {
       action: "idle",
@@ -304,7 +306,36 @@ const decide = ({
       reason: `ambient ${ambient}°C < hard floor ${AMBIENT_HARD_FLOOR_C}°C`,
     };
 
-  // 5. Outside heating window — Cyprus 600m nights / mornings kill COP.
+  // 4. Boost = "heat now". User opt-in to inefficient heating in exchange for
+  // speed. Skips the heating window, the soft floor, AND the deadband hold
+  // below — but NOT the upper bound (step 2) or the hard floor (step 3).
+  if (boostOverride) {
+    return {
+      action: "heat",
+      mode: "boost",
+      reason: `BOOST: heating to ${targetTemp}°C, ignoring window/soft-floor`,
+    };
+  }
+
+  // 5. Deadband hold — second half of the hysteresis. Step 2 already idled
+  // anything >= target+hyst; here, if the pump is currently OFF and the pool
+  // hasn't yet fallen to target-hyst, keep it off so we don't re-fire on the
+  // way down (real deadband, not bang-bang). If currently HEATING, or the
+  // pool is already <= target-hyst, fall through and (keep) heating. Boost
+  // skips this — it forces heat below the upper bound.
+  if (
+    typeof poolTemp === "number" &&
+    poolTemp > targetTemp - TARGET_HYSTERESIS_C &&
+    !heatingNow
+  ) {
+    return {
+      action: "idle",
+      mode: null,
+      reason: `pool ${poolTemp}°C in deadband, holding off until ≤ ${round1(targetTemp - TARGET_HYSTERESIS_C)}°C`,
+    };
+  }
+
+  // 6. Outside heating window — Cyprus 600m nights / mornings kill COP.
   if (!inHeatingWindow(now)) {
     return {
       action: "idle",
@@ -313,7 +344,7 @@ const decide = ({
     };
   }
 
-  // 6. Soft floor — surfaces Boost as the explicit override path.
+  // 7. Soft floor — surfaces Boost as the explicit override path.
   if (ambient < AMBIENT_SOFT_FLOOR_C) {
     return {
       action: "idle",
@@ -322,7 +353,7 @@ const decide = ({
     };
   }
 
-  // 7. Heat. Default = silent (highest COP). Optionally upgrade to smart
+  // 8. Heat. Default = silent (highest COP). Optionally upgrade to smart
   // when the gap-to-target exceeds SMART_GAP_C — set SMART_GAP_C = 0 to
   // disable the upgrade entirely (energy-saving default). If the upgrade
   // is disabled and the pump is currently in smart, reconcile() snaps it
@@ -486,12 +517,19 @@ const poolTemp =
 // "false" = outlet proxy or stale vDev value.
 const poolTempIsTrue = externalSensorTemp !== null || inletFromPump !== null;
 
+// Current commanded on/off state — the hysteresis deadband needs it to "hold"
+// inside the band (see decide() step 5). Mirrors reconcile()'s `pumpOn` read.
+// Pump unreachable (snap=null) → false; reconcile() is skipped that tick, so
+// this only affects the displayed status reason, never a command.
+const heatingNow = snap?.SWITCHED_ON === 1 || snap?.SWITCHED_ON === true;
+
 const decision = decide({
   intentOn,
   boostOverride,
   ambient: ambientNetatmo,
   poolTemp,
   targetTemp,
+  heatingNow,
   now,
 });
 
