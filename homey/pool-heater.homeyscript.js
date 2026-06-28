@@ -75,10 +75,12 @@ const EXTERNAL_POOL_TEMP_SENSOR = true;
 //   boolean3 Pump Running (plain boolean, Insights graphs on/off bands),
 //   boolean4 Pump Error (Show-As alarm_pump_device → standard pump-alarm UI).
 //
-// Pool temperature is NOT a DeviceCapabilities custom field on this device
-// (despite what the old flow assumed) - it's the standard Homey
-// `measure_temperature` capability that renders on the tile. Written via
-// direct `setCapabilityValue` below, not through `runFlowCardAction`.
+// Pool temperature is surfaced via the DC custom field `number1`
+// ("Temperature (Measured)", Show-As measure_temperature) — written through
+// the `virtualdevice_set_number` flow card (NOT direct `setCapabilityValue`,
+// which returns "Capability Not Setable"). Exception: with
+// EXTERNAL_POOL_TEMP_SENSOR=true, number1 is Reflect-bound to a dedicated
+// sensor and we never write it (see the pool_temp guard further below).
 //
 // Number slot history:
 //   number1 was "Temperature (Measured)" (Show-As measure_temperature). With
@@ -91,6 +93,11 @@ const VFIELD = {
   boost_intent: { id: "boolean2", name: "Boost Mode" },
   pump_running: { id: "boolean3", name: "Pump Running" },
   pump_error: { id: "boolean4", name: "Pump Error" },
+  // pool_temp → number1 (Show-As measure_temperature). Only written when
+  // EXTERNAL_POOL_TEMP_SENSOR=false; with the external sensor on, number1 is
+  // Reflect-bound and left untouched. Entry must exist either way so the
+  // pump-sensor fallback path (below) doesn't throw `unknown vfield`.
+  pool_temp: { id: "number1", name: "Temperature (Measured)" },
   ambient: { id: "number3", name: "Ambient Temperature" },
   compressor: { id: "number4", name: "Compressor Rate" },
   outlet: { id: "number5", name: "Outlet Temperature" },
