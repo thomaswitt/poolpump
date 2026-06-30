@@ -13,7 +13,8 @@
  *   from device-toggle triggers.
  *
  * Strategy:
- *   - Heat only when ambient >= 22C AND time in 09:00..15:00 local.
+ *   - Heat only when ambient >= 22C AND time in 09:00..15:00 local. On warm
+ *     mornings (ambient >= 24C) the window opens early, from 07:00.
  *   - Mode: silent by default (highest COP, lowest draw). Smart-upgrade
  *     on a wide gap is gated by SMART_GAP_C — set to 0 to disable
  *     entirely (the energy-saving default). Boost is the user override
@@ -45,6 +46,13 @@ const AMBIENT_HARD_FLOOR_C = 18; // below this: never heat
 const AMBIENT_SOFT_FLOOR_C = 22; // below this in window: only with explicit boost
 const HEATING_WINDOW_START_H = 9; // local time
 const HEATING_WINDOW_END_H = 15;
+// Warm-morning early start: when ambient is already >= EARLY_START_AMBIENT_C,
+// open the heating window as early as EARLY_START_HOUR_H instead of 09:00. The
+// pump's COP is set by air temp, not the clock (manual: operates -15..43°C), so
+// a warm post-sunrise morning heats efficiently; the 09:00 default only guards
+// nighttime heat-retention, not COP.
+const EARLY_START_HOUR_H = 7; // earliest start when warm enough
+const EARLY_START_AMBIENT_C = 24; // ambient at/above which the window opens early
 const TARGET_HYSTERESIS_C = 0.5; // stop heating when pool >= target + this; resume when <= target - this
 // Smart-mode upgrade threshold: if (target - pool) > SMART_GAP_C, upgrade
 // silent → smart for faster heat at higher consumption.
@@ -234,9 +242,19 @@ const localHour = (date) =>
     }).format(date),
   );
 
-const inHeatingWindow = (date) => {
+// Effective window start: pulled forward to EARLY_START_HOUR_H on warm mornings
+// (ambient >= EARLY_START_AMBIENT_C), else the regular HEATING_WINDOW_START_H.
+// Non-numeric ambient → regular start, never early, never throws. Defensive:
+// the live path reads ambient via readNumber (which throws on non-numbers), so
+// this only matters for direct unit tests of decide().
+const effectiveStartHour = (ambient) =>
+  typeof ambient === "number" && ambient >= EARLY_START_AMBIENT_C
+    ? EARLY_START_HOUR_H
+    : HEATING_WINDOW_START_H;
+
+const inHeatingWindow = (date, ambient) => {
   const h = localHour(date);
-  return h >= HEATING_WINDOW_START_H && h < HEATING_WINDOW_END_H;
+  return h >= effectiveStartHour(ambient) && h < HEATING_WINDOW_END_H;
 };
 
 // --- decision -------------------------------------------------------------
@@ -269,8 +287,10 @@ const inHeatingWindow = (date) => {
  *                                  on/off thrash. If currently HEATING (or pool
  *                                  already <= target - hyst) it falls through
  *                                  and keeps/starts heating.
- *   6. Outside heating window   → idle (Cyprus nights/mornings at 600m kill
- *                                  COP regardless of ambient)
+ *   6. Outside heating window   → idle. Guards nighttime heat-retention, not
+ *                                  COP. The morning start pulls forward to
+ *                                  EARLY_START_HOUR_H when ambient is already
+ *                                  >= EARLY_START_AMBIENT_C (warm = good COP).
  *   7. Soft floor (ambient<22)  → idle (suggests Boost as the override path)
  *   8. Otherwise                → HEAT, mode by gap-to-target
  *
@@ -342,12 +362,15 @@ const decide = ({
     };
   }
 
-  // 6. Outside heating window — Cyprus 600m nights / mornings kill COP.
-  if (!inHeatingWindow(now)) {
+  // 6. Outside heating window — guards nighttime heat-retention (a heated pool
+  // bleeds heat to the cold night sky / evaporation faster than the pump adds
+  // it). NOT a COP gate: COP tracks air temp, and a warm post-sunrise morning
+  // pulls the start forward to EARLY_START_HOUR_H (see effectiveStartHour).
+  if (!inHeatingWindow(now, ambient)) {
     return {
       action: "idle",
       mode: null,
-      reason: `outside heating window (allowed ${HEATING_WINDOW_START_H}-${HEATING_WINDOW_END_H})`,
+      reason: `outside heating window (allowed ${effectiveStartHour(ambient)}-${HEATING_WINDOW_END_H}; early start ${EARLY_START_HOUR_H} if ambient ≥ ${EARLY_START_AMBIENT_C}°C)`,
     };
   }
 
